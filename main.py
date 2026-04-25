@@ -155,7 +155,6 @@ def read_root():
 @app.post("/analyze/")
 async def analyze_bin(
     image_file: UploadFile = File(...),
-    bin_id: Optional[str] = None,
     lat: Optional[float] = None,
     lng: Optional[float] = None,
 ):
@@ -174,9 +173,9 @@ async def analyze_bin(
         fill_results = fill_model(image)
         if len(fill_results[0].boxes) > 0:
             best = fill_results[0].boxes[0]
-            fill_status = fill_model.names[int(best.cls[0])]   # raw label
+            fill_status = fill_model.names[int(best.cls[0])]
             fill_confidence = round(float(best.conf[0]), 3)
-        fill_level_int = FILL_LEVEL_MAP.get(fill_status, 0)   # integer for queries
+        fill_level_int = FILL_LEVEL_MAP.get(fill_status, 0)
         print(f"-> Fill Model OK: label='{fill_status}', level={fill_level_int}%, conf={fill_confidence}")
 
         # ── Step 3: Run Waste Type Model ───────────────────────────────────────
@@ -200,37 +199,23 @@ async def analyze_bin(
         )
         print(f"-> Waste Model OK: primary='{primary_waste_type}', detections={len(detected_waste)}")
 
-        # ── Step 4: Build Firestore document ───────────────────────────────────
-        # lat and lng come directly from the request parameters — no modification.
-        # fill_status is the raw YOLO label — stored as-is.
-        # fill_level_int is derived only so the Routing API can use fillLevel > 70.
+        # ── Step 4: Build Firestore document and auto-generate ID ─────────────
         print("Step 4: Writing to Firestore...")
         bin_data: dict = {
-            "fillStatus":    fill_status,       # raw YOLO label: "Empty"|"Partial"|"Full"
-            "fillLevel":     fill_level_int,     # integer: 10 | 50 | 95
+            "fillStatus":    fill_status,
+            "fillLevel":     fill_level_int,
             "wasteType":     primary_waste_type,
             "aiConfidence":  fill_confidence,
-            "detectedWaste": detected_waste,     # full raw detection list
+            "detectedWaste": detected_waste,
+            "lat":           lat if lat is not None else 0.0,
+            "lng":           lng if lng is not None else 0.0,
             "lastAnalyzed":  datetime.now(timezone.utc),
         }
 
-        # Store lat/lng exactly as received from the phone — no processing.
-        if lat is not None:
-            bin_data["lat"] = lat
-        if lng is not None:
-            bin_data["lng"] = lng
-
-        if bin_id:
-            db.collection("bins").document(bin_id).set(bin_data, merge=True)
-            saved_bin_id = bin_id
-            print(f"-> Updated existing bin: {bin_id}")
-        else:
-            new_doc = db.collection("bins").document()
-            saved_bin_id = new_doc.id
-            bin_data.setdefault("lat", 0.0)
-            bin_data.setdefault("lng", 0.0)
-            new_doc.set(bin_data)
-            print(f"-> Created new bin: {saved_bin_id}")
+        new_doc = db.collection("bins").document()
+        saved_bin_id = new_doc.id
+        new_doc.set(bin_data)
+        print(f"-> Created new bin: {saved_bin_id}")
 
         print("========== ANALYSIS COMPLETE ==========\n")
         return {
