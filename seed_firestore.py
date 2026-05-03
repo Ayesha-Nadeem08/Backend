@@ -30,37 +30,69 @@ now = datetime.now(timezone.utc)
 
 DEMO_PASSWORD = "CleanCore@123"
 
-# ── Bin test data — 18 bins across 6 Berlin districts ─────────────────────────
+# ── Bin test data — 21 bins across Islamabad/Rawalpindi ──────────────────────
+# IMPORTANT: area strings here must be BYTE-FOR-BYTE identical to the
+# assignedArea values in seed_workers.py (exact match, case-sensitive).
+#
+# fillLevel, fillStatus, and aiConfidence are real values produced by running
+# the YOLO fill_model + waste_model on the 21 images in asset/bins/ (1-to-1
+# mapping in alphabetical filename order).  Run infer_bins.py to regenerate.
 BINS: list[dict] = [
-    # Islamabad - F-6/F-7 area
-    {"area": "F-6 Islamabad", "wasteType": "Plastic", "fillLevel": 92, "lat": 33.7296, "lng": 73.0748},
-    {"area": "F-7 Islamabad", "wasteType": "Plastic", "fillLevel": 74, "lat": 33.7226, "lng": 73.0583},
-    {"area": "F-6 Islamabad", "wasteType": "Plastic", "fillLevel": 35, "lat": 33.7315, "lng": 73.0780},
+    # ── G-9 Markaz, Islamabad ─────────────────────────────────────────────────
+    # image: 1000638068_jpg.rf.5990179f6797b8de122dd9b42b00d11a.jpg
+    {"area": "G-9",  "wasteType": "General", "fillLevel": 98, "fillStatus": "Overflowing", "aiConfidence": 0.971, "lat": 33.6938, "lng": 73.0651},
+    # image: IMG-20251004-WA0012_jpg.rf.df3adb70ceccc6b8c365210c6a26dd1f.jpg
+    {"area": "G-9",  "wasteType": "Plastic",  "fillLevel": 55, "fillStatus": "Half-Full",   "aiConfidence": 0.855, "lat": 33.6850, "lng": 73.0580},
+    # image: IMG-20251004-WA0029_jpg.rf.e15d76723cb76cd76900b82fc934f953.jpg
+    {"area": "G-9",  "wasteType": "Organic",  "fillLevel": 98, "fillStatus": "Overflowing", "aiConfidence": 0.684, "lat": 33.6880, "lng": 73.0620},
+    # image: IMG-20251004-WA0032-1-_jpg.rf.4886555c49a49e31e0d458d4b09fad0b.jpg
+    {"area": "G-9",  "wasteType": "General",  "fillLevel": 98, "fillStatus": "Overflowing", "aiConfidence": 0.931, "lat": 33.6910, "lng": 73.0700},
 
-    # Islamabad - G-9 area
-    {"area": "G-9 Islamabad", "wasteType": "General", "fillLevel": 88, "lat": 33.6844, "lng": 73.0238},
-    {"area": "G-10 Islamabad", "wasteType": "General", "fillLevel": 91, "lat": 33.6766, "lng": 73.0112},
-    {"area": "G-9 Islamabad", "wasteType": "General", "fillLevel": 55, "lat": 33.6880, "lng": 73.0270},
+    # ── Blue Area, Islamabad ──────────────────────────────────────────────────
+    # image: IMG-20251016-WA0003_jpg.rf.eeacaeb7b42ac33ce8d570ccda5c5f06.jpg
+    {"area": "Blue Area", "wasteType": "General", "fillLevel": 55, "fillStatus": "Half-Full", "aiConfidence": 0.948, "lat": 33.7264, "lng": 73.0979},
+    # image: IMG-20251016-WA0004_jpg.rf.abc0e7dac0881d708de5235e89c81300.jpg
+    {"area": "Blue Area", "wasteType": "Plastic",  "fillLevel": 55, "fillStatus": "Half-Full", "aiConfidence": 0.945, "lat": 33.7240, "lng": 73.0940},
+    # image: IMG-20251016-WA0008_jpg.rf.62dec5bb9e357db1396783409c3b91e7.jpg
+    {"area": "Blue Area", "wasteType": "Organic",  "fillLevel": 55, "fillStatus": "Half-Full", "aiConfidence": 0.925, "lat": 33.7280, "lng": 73.1010},
+    # image: IMG-20251016-WA0018_jpg.rf.003c60b2e5d5a605bee9f805e51888b1.jpg
+    {"area": "Blue Area", "wasteType": "Paper",    "fillLevel": 85, "fillStatus": "Full",       "aiConfidence": 0.962, "lat": 33.7260, "lng": 73.0960},
 
-    # Rawalpindi - Saddar/Cantt area
-    {"area": "Saddar Pindi", "wasteType": "Glass", "fillLevel": 78, "lat": 33.5950, "lng": 73.0545},
-    {"area": "Pindi Cantt", "wasteType": "Glass", "fillLevel": 95, "lat": 33.5910, "lng": 73.0500},
-    {"area": "Saddar Pindi", "wasteType": "Glass", "fillLevel": 42, "lat": 33.5980, "lng": 73.0590},
+    # ── F-6 Islamabad ─────────────────────────────────────────────────────────
+    # image: IMG-20251016-WA0020_jpg.rf.0d725669fe9e26dc382465d2ad125736.jpg
+    {"area": "F-6 Islamabad", "wasteType": "Plastic", "fillLevel": 85, "fillStatus": "Full",      "aiConfidence": 0.960, "lat": 33.7296, "lng": 73.0748},
+    # image: IMG_20251014_163927_jpg.rf.a32c8967584f3ca68d66f5c43c96ada1.jpg
+    {"area": "F-6 Islamabad", "wasteType": "Plastic", "fillLevel": 55, "fillStatus": "Half-Full", "aiConfidence": 0.926, "lat": 33.7315, "lng": 73.0780},
 
-    # Islamabad - E-11 area
-    {"area": "E-11 Islamabad", "wasteType": "Metal", "fillLevel": 85, "lat": 33.6995, "lng": 72.9830},
-    {"area": "E-11 Islamabad", "wasteType": "Metal", "fillLevel": 70, "lat": 33.7020, "lng": 72.9870},
-    {"area": "E-11 Islamabad", "wasteType": "Metal", "fillLevel": 28, "lat": 33.6970, "lng": 72.9790},
+    # ── Saddar Pindi ──────────────────────────────────────────────────────────
+    # image: IMG_20251014_164011_jpg.rf.6d48f4b2185c6003be8cd2d23bdf434a.jpg
+    {"area": "Saddar Pindi", "wasteType": "Glass", "fillLevel": 55, "fillStatus": "Half-Full", "aiConfidence": 0.953, "lat": 33.5950, "lng": 73.0545},
+    # image: IMG_20251014_164205_jpg.rf.8258881cd4066c9fe4182083fc41d9e3.jpg
+    {"area": "Saddar Pindi", "wasteType": "Glass", "fillLevel": 55, "fillStatus": "Half-Full", "aiConfidence": 0.967, "lat": 33.5910, "lng": 73.0500},
+    # image: IMG_20251014_170013_1_jpg.rf.cb19c691c8faa0ce74d134908ac0ed64.jpg
+    {"area": "Saddar Pindi", "wasteType": "Glass", "fillLevel":  5, "fillStatus": "Empty",     "aiConfidence": 0.899, "lat": 33.5980, "lng": 73.0590},
 
-    # Rawalpindi - Bahria Phase 7
-    {"area": "Bahria Phase 7", "wasteType": "Organic", "fillLevel": 93, "lat": 33.5235, "lng": 73.0945},
-    {"area": "Bahria Phase 7", "wasteType": "Organic", "fillLevel": 76, "lat": 33.5250, "lng": 73.0980},
-    {"area": "Bahria Phase 8", "wasteType": "Organic", "fillLevel": 60, "lat": 33.5180, "lng": 73.0850},
+    # ── E-11 Islamabad ────────────────────────────────────────────────────────
+    # image: IMG_20251025_140150_jpg.rf.8905517a01bf92a34bd15c51a77e7b47.jpg
+    {"area": "E-11 Islamabad", "wasteType": "Metal", "fillLevel": 85, "fillStatus": "Full",      "aiConfidence": 0.850, "lat": 33.6995, "lng": 72.9830},
+    # image: IMG_20251025_140757_jpg.rf.8fd5432385f23c8cf99fd5af46f54d9f.jpg
+    {"area": "E-11 Islamabad", "wasteType": "Metal", "fillLevel": 85, "fillStatus": "Full",      "aiConfidence": 0.918, "lat": 33.7020, "lng": 72.9870},
+    # image: IMG_20251025_143802_jpg.rf.bd858ece8f2103e8b3b9d8c872f26c51.jpg
+    {"area": "E-11 Islamabad", "wasteType": "Metal", "fillLevel": 85, "fillStatus": "Full",      "aiConfidence": 0.941, "lat": 33.6970, "lng": 72.9790},
 
-    # Islamabad - I-8/I-9 area
-    {"area": "I-8 Islamabad", "wasteType": "Paper", "fillLevel": 89, "lat": 33.6685, "lng": 73.0765},
-    {"area": "I-9 Islamabad", "wasteType": "Paper", "fillLevel": 71, "lat": 33.6610, "lng": 73.0640},
-    {"area": "I-8 Islamabad", "wasteType": "Paper", "fillLevel": 45, "lat": 33.6710, "lng": 73.0800},
+    # ── Bahria Phase 7 ────────────────────────────────────────────────────────
+    # image: IMG_20251025_143947_jpg.rf.de3df66ddc2d817497f67c37e17672ff.jpg
+    {"area": "Bahria Phase 7", "wasteType": "Organic", "fillLevel": 55, "fillStatus": "Half-Full", "aiConfidence": 0.960, "lat": 33.5235, "lng": 73.0945},
+    # image: IMG_20251025_144541_jpg.rf.12fc8f3fcf890c32cea5aa939fafbb5b.jpg
+    {"area": "Bahria Phase 7", "wasteType": "Organic", "fillLevel":  5, "fillStatus": "Empty",     "aiConfidence": 0.901, "lat": 33.5250, "lng": 73.0980},
+
+    # ── I-8 Islamabad ─────────────────────────────────────────────────────────
+    # image: IMG_20251025_145109_jpg.rf.1f47bfafcace29c9b4a3cda35170fbd6.jpg
+    {"area": "I-8 Islamabad", "wasteType": "Paper", "fillLevel": 55, "fillStatus": "Half-Full", "aiConfidence": 0.928, "lat": 33.6685, "lng": 73.0765},
+    # image: IMG_20251025_145725_jpg.rf.ba7a1a84250d5f36a75e88025f5fed5f.jpg
+    {"area": "I-8 Islamabad", "wasteType": "Paper", "fillLevel": 85, "fillStatus": "Full",      "aiConfidence": 0.866, "lat": 33.6610, "lng": 73.0640},
+    # image: IMG_20251025_152731_jpg.rf.3d5ce5d5132395d5e0be4f0edc972fee.jpg
+    {"area": "I-8 Islamabad", "wasteType": "Paper", "fillLevel": 55, "fillStatus": "Half-Full", "aiConfidence": 0.902, "lat": 33.6710, "lng": 73.0800},
 ]
 
 # ── Worker test accounts — must match an existing Firebase Auth UID or be      ──
@@ -194,19 +226,20 @@ def clear_collection(col: str) -> None:
 def seed_bins() -> None:
     print("\n[bins] Seeding bins...")
     batch = db.batch()
-    for i, b in enumerate(BINS):
+    for b in BINS:
         ref = db.collection("bins").document()
         batch.set(ref, {
             "area":          b["area"],
             "wasteType":     b["wasteType"],
             "fillLevel":     b["fillLevel"],
+            "fillStatus":    b["fillStatus"],
             "status":        _status_from_fill(b["fillLevel"]),
             "lat":           b["lat"],
             "lng":           b["lng"],
             "isLocked":      False,
             "capacity":      240,
-            "aiConfidence":  0.0,
-            "lastAnalyzed":  None,
+            "aiConfidence":  b["aiConfidence"],
+            "lastAnalyzed":  now,
             "createdAt":     now,
         })
     batch.commit()

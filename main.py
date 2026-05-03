@@ -6,6 +6,7 @@ import traceback
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,7 +57,54 @@ fill_model = YOLO("models/fill_model.pt")
 waste_model = YOLO("models/waste_model.pt")
 print("Models loaded successfully!")
 
-FILL_LEVEL_MAP = {"Empty": 10, "Partial": 50, "Full": 95}
+FILL_LEVEL_MAP: dict[str, int] = {
+    # ── Exact labels (as returned by model after .strip().title()) ────────────
+    "Empty":       5,
+    "Low":         20,
+    "Partial":     40,
+    "Half-Full":   55,
+    "Half Full":   55,
+    "Medium":      55,
+    "Full":        85,
+    "Overflowing": 98,
+    "Overflow":    98,
+    "Critical":    95,
+    # ── Fallbacks for raw lowercase / uppercase variants ──────────────────────
+    "empty":       5,
+    "low":         20,
+    "partial":     40,
+    "half-full":   55,
+    "half full":   55,
+    "medium":      55,
+    "full":        85,
+    "overflowing": 98,
+    "overflow":    98,
+    "critical":    95,
+}
+
+def _label_to_fill_int(label: str) -> int:
+    """Map a YOLO fill-level class label to a 0-100 integer.
+
+    Tries an exact lookup first, then a case-insensitive keyword scan so that
+    unexpected label variants (e.g. 'Half_Full', 'FULL', 'Near Full') never
+    silently produce 0.
+    """
+    if label in FILL_LEVEL_MAP:
+        return FILL_LEVEL_MAP[label]
+    lower = label.lower().replace("_", " ").replace("-", " ")
+    if "overflow" in lower or "overfull" in lower:
+        return 98
+    if "full" in lower and ("half" in lower or "mid" in lower or "medium" in lower or "partial" in lower):
+        return 55
+    if "full" in lower or "critical" in lower:
+        return 85
+    if "partial" in lower or "medium" in lower or "mid" in lower or "half" in lower:
+        return 55
+    if "low" in lower or "quarter" in lower:
+        return 20
+    if "empty" in lower:
+        return 5
+    return 0   # truly unknown
 
 # Waste types that violate German noise regulations at night (22:00–07:00)
 NOISY_WASTE_TYPES = {"glass", "metal"}
@@ -114,6 +162,23 @@ def _greedy_nearest_neighbor(stops: list, depot_lat: float, depot_lng: float) ->
         unvisited.remove(nearest)
     return ordered
 
+def _two_opt_improve(stops: list, depot_lat: float, depot_lng: float) -> list:
+    """2-opt local-search refinement after greedy ordering. Caps at 3 passes."""
+    best = list(stops)
+    best_dist = _total_route_km(best, depot_lat, depot_lng)
+    improved = True
+    passes = 0
+    while improved and passes < 3:
+        improved = False
+        passes += 1
+        for i in range(len(best) - 1):
+            for j in range(i + 2, len(best)):
+                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
+                dist = _total_route_km(candidate, depot_lat, depot_lng)
+                if dist < best_dist - 0.001:
+                    best, best_dist, improved = candidate, dist, True
+    return best
+
 def _total_route_km(ordered: list, depot_lat: float, depot_lng: float) -> float:
     total = 0.0
     prev_lat, prev_lng = depot_lat, depot_lng
@@ -123,11 +188,10 @@ def _total_route_km(ordered: list, depot_lat: float, depot_lng: float) -> float:
     total += _haversine_km(prev_lat, prev_lng, depot_lat, depot_lng)
     return round(total, 3)
 
-def _is_quiet_hours_berlin() -> bool:
-    """True when Berlin local time (CET, UTC+1 approximation) is between 22:00 and 07:00."""
-    berlin_tz = timezone(timedelta(hours=1))
-    hour = datetime.now(berlin_tz).hour
-    return hour >= 22 or hour < 7
+def _is_quiet_hours() -> bool:
+    """True when Islamabad local time (PKT, UTC+5) is between 23:00 and 05:00 — no heavy-waste collection at night."""
+    hour = datetime.now(ZoneInfo("Asia/Karachi")).hour
+    return hour >= 23 or hour < 5
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
@@ -143,7 +207,10 @@ async def analyze_bin(
     image_file: UploadFile = File(...),
     lat: Optional[float] = None,
     lng: Optional[float] = None,
+    area: Optional[str] = None,
+    bin_id: Optional[str] = None,   # if provided, UPDATE existing doc instead of creating new
 ):
+    # Bins are ONLY created through this endpoint — never seed them manually.
     print("\n========== STARTING AI ANALYSIS ==========")
     try:
         print("Step 1: Reading uploaded image...")
@@ -160,7 +227,7 @@ async def analyze_bin(
             raw_label = fill_model.names[int(best.cls[0])]
             fill_status = raw_label.strip().title()
             fill_confidence = round(float(best.conf[0]), 3)
-        fill_level_int = FILL_LEVEL_MAP.get(fill_status, 0)
+        fill_level_int = _label_to_fill_int(fill_status)
         print(f"-> Fill Model OK: label='{fill_status}', level={fill_level_int}%, conf={fill_confidence}")
 
         detected_waste = []
@@ -189,22 +256,44 @@ async def analyze_bin(
             print("Step 3: Skipped — no bin detected by fill model.")
 
         print("Step 4: Writing to Firestore...")
+        bin_status = ("critical" if fill_level_int >= 90 else "warning" if fill_level_int >= 70 else "normal")
+        bin_lat  = lat if lat is not None else 0.0
+        bin_lng  = lng if lng is not None else 0.0
+        bin_area = (area or "").strip()
         bin_data: dict = {
             "fillStatus":    fill_status,
             "fillLevel":     fill_level_int,
             "wasteType":     primary_waste_type,
             "aiConfidence":  fill_confidence,
             "detectedWaste": detected_waste,
-            "lat":           lat if lat is not None else 0.0,
-            "lng":           lng if lng is not None else 0.0,
+            "lat":           bin_lat,
+            "lng":           bin_lng,
             "isLocked":      False,
+            "status":        bin_status,
+            "capacity":      240,
+            "area":          bin_area,
+            "sector":        bin_area,
             "lastAnalyzed":  datetime.now(timezone.utc),
         }
 
-        new_doc = db.collection("bins").document()
-        saved_bin_id = new_doc.id
-        new_doc.set(bin_data)
-        print(f"-> Created new bin: {saved_bin_id}")
+        # Update existing bin if bin_id given, otherwise create a new document
+        if bin_id:
+            bin_ref = db.collection("bins").document(bin_id)
+            if bin_ref.get().exists:
+                # Preserve isLocked / routeId — don't overwrite routing state
+                update_fields = {k: v for k, v in bin_data.items() if k not in ("isLocked",)}
+                bin_ref.update(update_fields)
+                saved_bin_id = bin_id
+                print(f"-> Updated existing bin: {saved_bin_id}")
+            else:
+                bin_ref.set(bin_data)
+                saved_bin_id = bin_id
+                print(f"-> Created bin with provided id: {saved_bin_id}")
+        else:
+            new_doc = db.collection("bins").document()
+            saved_bin_id = new_doc.id
+            new_doc.set(bin_data)
+            print(f"-> Created new bin: {saved_bin_id}")
 
         # --- SFR-017: FCM Push Notifications for Urgent Overflows ---
         if fill_level_int >= 90:
@@ -220,7 +309,7 @@ async def analyze_bin(
                 
                 # We need to make sure we don't duplicate
                 if not any(s.get("binId") == saved_bin_id for s in stops):
-                    new_doc.update({"isLocked": True, "routeId": route_doc.id, "area": bin_area})
+                    db.collection("bins").document(saved_bin_id).update({"isLocked": True, "routeId": route_doc.id, "area": bin_area})
                     
                     stops.append({
                         "binId": saved_bin_id,
@@ -236,9 +325,9 @@ async def analyze_bin(
                     })
                     
                     # Notify the worker handling this route
-                    worker_id = r_data.get("driverId")
-                    if worker_id:
-                        worker_snap = db.collection("users").document(worker_id).get()
+                    route_driver_id = r_data.get("driverId")
+                    if route_driver_id:
+                        worker_snap = db.collection("users").document(route_driver_id).get()
                         if worker_snap.exists:
                             fcm_token = worker_snap.to_dict().get("fcmToken")
                             if fcm_token:
@@ -250,9 +339,18 @@ async def analyze_bin(
 
         print("========== ANALYSIS COMPLETE ==========\n")
         return {
-            "success": True,
-            "bin_id": saved_bin_id,
-            "filename": image_file.filename,
+            "success":      True,
+            "bin_id":       saved_bin_id,
+            "fillStatus":   fill_status,
+            "fillLevel":    fill_level_int,
+            "wasteType":    primary_waste_type,
+            "aiConfidence": fill_confidence,
+            "status":       bin_status,
+            "capacity":     240,
+            "area":         bin_area,
+            "lat":          bin_lat,
+            "lng":          bin_lng,
+            # Nested results kept for backward compatibility with client scan display
             "results": {
                 "fill_level": {
                     "status":     fill_status,
@@ -298,7 +396,14 @@ def optimize_route(req: OptimizeRouteRequest):
     worker = worker_snap.to_dict()
     assigned_area  = worker.get("assignedArea", "")
     assigned_waste = worker.get("assignedWasteType", "").lower()
-    quiet_hours    = _is_quiet_hours_berlin()
+    quiet_hours    = _is_quiet_hours()
+
+    # Reject GPS depot at (0,0) — this means location services are off on the device
+    if req.depot_lat == 0.0 and req.depot_lng == 0.0:
+        raise HTTPException(
+            status_code=422,
+            detail="Worker GPS is unavailable (coordinates 0,0 are invalid). Enable location services and try again."
+        )
 
     # 2. Fetch full bins and apply German-standard filters in Python
     bin_query = db.collection("bins").where(filter=FieldFilter("fillLevel", ">", 70)).stream()
@@ -311,9 +416,11 @@ def optimize_route(req: OptimizeRouteRequest):
         if data.get("isLocked", False):
             continue
 
-        # Area filter: worker only serves their assigned district
+        # Area filter: worker only serves their assigned district.
+        # Bins with no area set (e.g. scanned via Swagger) are treated as
+        # unassigned and float to any worker's route.
         bin_area = data.get("area", data.get("sector", ""))
-        if assigned_area and bin_area != assigned_area:
+        if assigned_area and bin_area and bin_area != assigned_area:
             continue
 
         # Waste type filter: worker only handles their assigned stream
@@ -342,11 +449,13 @@ def optimize_route(req: OptimizeRouteRequest):
     if not available_stops:
         detail = "No available bins match the worker's area and waste type constraints."
         if quiet_hours:
-            detail += " Note: Glass/Metal bins are excluded during quiet hours (22:00–07:00 Berlin time)."
+            detail += " Note: Glass/Metal bins are excluded during quiet hours (23:00–05:00 Islamabad time)."
         raise HTTPException(status_code=404, detail=detail)
 
-    # 3. Greedy Nearest-Neighbor ordering
+    # 3. Greedy Nearest-Neighbor ordering, then 2-opt refinement
     ordered_stops = _greedy_nearest_neighbor(available_stops, req.depot_lat, req.depot_lng)
+    if len(ordered_stops) > 2:
+        ordered_stops = _two_opt_improve(ordered_stops, req.depot_lat, req.depot_lng)
 
     # 4. Distance, fuel, and CO2 footprint (German standard: 0.95 kg CO2/km)
     total_km   = _total_route_km(ordered_stops, req.depot_lat, req.depot_lng)
@@ -388,8 +497,8 @@ def get_worker_route(worker_id: str):
     """Returns the worker's current active route with all ordered stops."""
     routes = list(
         db.collection("routes")
-        .where("driverId", "==", worker_id)
-        .where("status", "==", "active")
+        .where(filter=FieldFilter("driverId", "==", worker_id))
+        .where(filter=FieldFilter("status", "==", "active"))
         .limit(1)
         .stream()
     )
@@ -422,15 +531,28 @@ def complete_stop(req: CompleteStopRequest):
     stops = list(route_data.get("stops", []))
     fill_at_pickup, bin_area, bin_waste_type = 0, "", ""
     bin_lat, bin_lng = 0.0, 0.0
+    found = False
     for stop in stops:
         if stop.get("binId") == req.bin_id:
+            if stop.get("completed", False):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Stop '{req.bin_id}' is already marked as completed."
+                )
             stop["completed"]  = True
             fill_at_pickup     = stop.get("fillLevel", 0)
             bin_area           = stop.get("area", "")
             bin_waste_type     = stop.get("wasteType", "")
             bin_lat            = float(stop.get("lat", 0))
             bin_lng            = float(stop.get("lng", 0))
+            found = True
             break
+
+    if not found:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Bin '{req.bin_id}' is not a stop on route '{req.route_id}'."
+        )
 
     new_completed = route_data.get("completedStops", 0) + 1
     total_stops   = route_data.get("totalStops", 0)
@@ -469,6 +591,15 @@ def complete_stop(req: CompleteStopRequest):
         "completedAt":       now_utc,
     })
 
+    # Increment worker's lifetime collection counter — drives WorkerPerformanceChart
+    if req.worker_id:
+        try:
+            db.collection("users").document(req.worker_id).update({
+                "collections": firestore.Increment(1)
+            })
+        except Exception:
+            pass  # non-critical: chart will self-correct on next collection
+
     return {
         "success":         True,
         "route_status":    new_status,
@@ -479,23 +610,21 @@ def complete_stop(req: CompleteStopRequest):
 
 # ── Admin: pickup logs ────────────────────────────────────────────────────────
 @app.get("/admin/pickup-logs")
-def admin_pickup_logs(worker_id: Optional[str] = None, limit: int = 100):
-    limit = min(limit, 500)
+def admin_pickup_logs(worker_id: Optional[str] = None, limit: int = 20, page: int = 1):
+    limit  = min(max(limit, 1), 100)
+    page   = max(page, 1)
+    offset = (page - 1) * limit
+
+    base_q = db.collection("pickupLogs").order_by("completedAt", direction=firestore.Query.DESCENDING)
     if worker_id:
-        q = (
-            db.collection("pickupLogs")
-            .where(filter=FieldFilter("workerId", "==", worker_id))
-            .order_by("completedAt", direction=firestore.Query.DESCENDING)
-            .limit(limit)
-        )
-    else:
-        q = (
-            db.collection("pickupLogs")
-            .order_by("completedAt", direction=firestore.Query.DESCENDING)
-            .limit(limit)
-        )
-    logs = [doc.to_dict() for doc in q.stream()]
-    return {"success": True, "logs": logs, "count": len(logs)}
+        base_q = base_q.where(filter=FieldFilter("workerId", "==", worker_id))
+
+    # Fetch one extra doc to cheaply detect whether a next page exists
+    fetched = list(base_q.limit(offset + limit + 1).stream())
+    has_more = len(fetched) > offset + limit
+    page_docs = fetched[offset : offset + limit]
+    logs = [doc.to_dict() for doc in page_docs]
+    return {"success": True, "logs": logs, "count": len(logs), "page": page, "has_more": has_more}
 
 
 # ── Admin: all routes ─────────────────────────────────────────────────────────
@@ -591,7 +720,8 @@ def admin_delete_user(uid: str):
 
 # ── Admin KPI Dashboard ───────────────────────────────────────────────────────
 @app.get("/admin/stats")
-def admin_stats():
+def admin_stats(days: int = 30):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     full_bins = list(db.collection("bins").where(filter=FieldFilter("fillLevel", ">", 70)).stream())
     active_workers = list(
         db.collection("users")
@@ -599,7 +729,13 @@ def admin_stats():
         .where(filter=FieldFilter("status", "==", "active"))
         .stream()
     )
-    all_routes       = [doc.to_dict() for doc in db.collection("routes").stream()]
+    # Only scan routes within the window to avoid unbounded reads
+    all_routes = [
+        doc.to_dict()
+        for doc in db.collection("routes")
+        .where(filter=FieldFilter("createdAt", ">=", cutoff))
+        .stream()
+    ]
     active_routes    = [r for r in all_routes if r.get("status") == "active"]
     completed_routes = [r for r in all_routes if r.get("status") == "completed"]
 
@@ -610,7 +746,7 @@ def admin_stats():
     done_stops  = sum(r.get("completedStops", 0) for r in completed_routes)
     efficiency  = round(done_stops / total_stops * 100, 1) if total_stops > 0 else 0.0
 
-    pending_anomalies = list(db.collection("anomalies").where("status", "==", "pending").stream())
+    pending_anomalies = list(db.collection("anomalies").where(filter=FieldFilter("status", "==", "pending")).stream())
 
     return {
         "success": True,
@@ -657,6 +793,58 @@ async def test_image(image_file: UploadFile = File(...)):
     except Exception as e:
         return {"failed_at": "step5_firestore", "error": str(e)}
     return {"all_steps": "passed", "details": results}
+
+# ── Analytics Endpoints ───────────────────────────────────────────────────────
+
+@app.get("/admin/analytics/peak-hours")
+def analytics_peak_hours(days: int = 30):
+    """Pickups grouped by hour of day — shows busiest collection windows."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    hour_counts = [0] * 24
+    for doc in db.collection("pickupLogs").where(filter=FieldFilter("completedAt", ">=", cutoff)).stream():
+        ts = doc.to_dict().get("completedAt")
+        if ts and hasattr(ts, "hour"):
+            hour_counts[ts.hour] += 1
+    return {
+        "success": True,
+        "data": [{"hour": f"{h:02d}:00", "collections": hour_counts[h]} for h in range(24)],
+    }
+
+
+@app.get("/admin/analytics/fill-efficiency")
+def analytics_fill_efficiency(days: int = 14):
+    """Average fill level at pickup per day — lower = collecting too early, higher = collecting too late."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    daily: dict = {}
+    for doc in db.collection("pickupLogs").where(filter=FieldFilter("completedAt", ">=", cutoff)).stream():
+        data = doc.to_dict()
+        ts   = data.get("completedAt")
+        fill = data.get("fillLevelAtPickup", 0)
+        if ts and hasattr(ts, "month"):
+            key = f"{ts.month}/{ts.day}"
+            daily.setdefault(key, []).append(fill)
+    result = [
+        {"date": k, "avgFill": round(sum(v) / len(v), 1)}
+        for k, v in sorted(daily.items())
+    ]
+    return {"success": True, "data": result}
+
+
+@app.get("/admin/analytics/area-stats")
+def analytics_area_stats(days: int = 30):
+    """Collections per district — highlights which areas need most service."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    area_counts: dict = {}
+    for doc in db.collection("pickupLogs").where(filter=FieldFilter("completedAt", ">=", cutoff)).stream():
+        area = doc.to_dict().get("area", "Unknown") or "Unknown"
+        area_counts[area] = area_counts.get(area, 0) + 1
+    result = sorted(
+        [{"area": k, "collections": v} for k, v in area_counts.items()],
+        key=lambda x: x["collections"],
+        reverse=True,
+    )
+    return {"success": True, "data": result}
+
 
 # ── Serve Admin Panel (Vite build) ────────────────────────────────────────────
 # The Admin Panel React app is built into ../Admin_Panel/dist with base="/admin/".
