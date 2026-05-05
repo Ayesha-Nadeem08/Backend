@@ -21,6 +21,11 @@ from firebase_admin import auth as fb_auth, credentials, firestore, messaging
 
 from google.cloud.firestore_v1.base_query import FieldFilter
 
+import torch
+from ultralytics.nn.tasks import DetectionModel
+
+torch.serialization.add_safe_globals([DetectionModel])
+
 # ── Firebase Admin SDK ────────────────────────────────────────────────────────
 _cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
 cred = credentials.Certificate(_cred_path)
@@ -53,8 +58,11 @@ app.add_middleware(
 
 # ── YOLO Models ───────────────────────────────────────────────────────────────
 print("Loading AI Models...")
+_orig_torch_load = torch.load
+torch.load = lambda *a, **kw: _orig_torch_load(*a, **{**kw, "weights_only": False})
 fill_model = YOLO("models/fill_model.pt")
 waste_model = YOLO("models/waste_model.pt")
+torch.load = _orig_torch_load
 print("Models loaded successfully!")
 
 FILL_LEVEL_MAP: dict[str, int] = {
@@ -326,14 +334,14 @@ async def analyze_bin(
                 route_doc = active_routes[0]
                 r_data = route_doc.to_dict()
                 stops = r_data.get("stops", [])
-                
+
                 # Assign this bin to the found route
                 bin_area = r_data.get("assignedArea", "Unknown")
-                
+
                 # We need to make sure we don't duplicate
                 if not any(s.get("binId") == saved_bin_id for s in stops):
                     db.collection("bins").document(saved_bin_id).update({"isLocked": True, "routeId": route_doc.id, "area": bin_area})
-                    
+
                     stops.append({
                         "binId": saved_bin_id,
                         "lat": lat if lat is not None else 0.0,
@@ -346,7 +354,7 @@ async def analyze_bin(
                         "stops": stops,
                         "totalStops": r_data.get("totalStops", 0) + 1
                     })
-                    
+
                     # Notify the worker handling this route
                     route_driver_id = r_data.get("driverId")
                     if route_driver_id:
