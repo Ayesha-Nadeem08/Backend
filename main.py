@@ -142,6 +142,24 @@ class CreateUserRequest(BaseModel):
     assigned_area: str = ""
     assigned_waste_type: str = ""
 
+# ── Settings helper ───────────────────────────────────────────────────────────
+def _get_thresholds() -> tuple[int, int]:
+    """Read warning and critical fill thresholds from Firestore settings/main.
+    Admin Panel saves these via the Settings → General → Collection Settings sliders.
+    Falls back to (70, 90) if the document doesn't exist or a read error occurs."""
+    try:
+        snap = db.collection("settings").document("main").get()
+        if snap.exists:
+            data     = snap.to_dict() or {}
+            warning  = int(data.get("warningThreshold",  70))
+            critical = int(data.get("criticalThreshold", 90))
+            # Basic sanity: warning must be strictly less than critical
+            if 0 < warning < critical <= 100:
+                return warning, critical
+    except Exception as e:
+        print(f"[settings] Could not read thresholds, using defaults: {e}")
+    return 70, 90
+
 # ── Routing Helpers ───────────────────────────────────────────────────────────
 def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     R = 6371.0
@@ -256,7 +274,12 @@ async def analyze_bin(
             print("Step 3: Skipped — no bin detected by fill model.")
 
         print("Step 4: Writing to Firestore...")
-        bin_status = ("critical" if fill_level_int >= 90 else "warning" if fill_level_int >= 70 else "normal")
+        warning_thresh, critical_thresh = _get_thresholds()
+        bin_status = (
+            "critical" if fill_level_int >= critical_thresh
+            else "warning" if fill_level_int >= warning_thresh
+            else "normal"
+        )
         bin_lat  = lat if lat is not None else 0.0
         bin_lng  = lng if lng is not None else 0.0
         bin_area = (area or "").strip()
@@ -296,7 +319,7 @@ async def analyze_bin(
             print(f"-> Created new bin: {saved_bin_id}")
 
         # --- SFR-017: FCM Push Notifications for Urgent Overflows ---
-        if fill_level_int >= 90:
+        if fill_level_int >= critical_thresh:
             # Find an active route to dynamically append this urgent pickup
             active_routes = list(db.collection("routes").where(filter=FieldFilter("status", "==", "active")).limit(1).stream())
             if active_routes:
@@ -405,8 +428,11 @@ def optimize_route(req: OptimizeRouteRequest):
             detail="Worker GPS is unavailable (coordinates 0,0 are invalid). Enable location services and try again."
         )
 
-    # 2. Fetch full bins and apply German-standard filters in Python
-    bin_query = db.collection("bins").where(filter=FieldFilter("fillLevel", ">", 70)).stream()
+    # 2. Read admin-configurable thresholds, then fetch qualifying bins
+    collection_threshold, critical_threshold = _get_thresholds()
+    bin_query = db.collection("bins").where(
+        filter=FieldFilter("fillLevel", ">=", collection_threshold)
+    ).stream()
     available_stops = []
 
     for doc in bin_query:
@@ -416,12 +442,23 @@ def optimize_route(req: OptimizeRouteRequest):
         if data.get("isLocked", False):
             continue
 
-        # Area filter: worker only serves their assigned district.
-        # Bins with no area set (e.g. scanned via Swagger) are treated as
-        # unassigned and float to any worker's route.
-        bin_area = data.get("area", data.get("sector", ""))
-        if assigned_area and bin_area and bin_area != assigned_area:
+        lat = float(data.get("lat", 0))
+        lng = float(data.get("lng", 0))
+        if lat == 0.0 and lng == 0.0:
             continue
+
+        # Area filter: assigned workers only see their district.
+        # Unassigned workers (no assignedArea) fall back to a 10 km proximity
+        # filter centred on their depot GPS so the route matches what is shown
+        # on the map.
+        bin_area = data.get("area", data.get("sector", ""))
+        if assigned_area:
+            if bin_area and bin_area != assigned_area:
+                continue
+        else:
+            dist_km = _haversine_km(req.depot_lat, req.depot_lng, lat, lng)
+            if dist_km > 10:
+                continue
 
         # Waste type filter: worker only handles their assigned stream
         waste_type = data.get("wasteType", "")
@@ -430,11 +467,6 @@ def optimize_route(req: OptimizeRouteRequest):
 
         # German noise regulation: no Glass or Metal collections at night
         if quiet_hours and waste_type.lower() in NOISY_WASTE_TYPES:
-            continue
-
-        lat = float(data.get("lat", 0))
-        lng = float(data.get("lng", 0))
-        if lat == 0.0 and lng == 0.0:
             continue
 
         available_stops.append({
@@ -447,7 +479,7 @@ def optimize_route(req: OptimizeRouteRequest):
         })
 
     if not available_stops:
-        detail = "No available bins match the worker's area and waste type constraints."
+        detail = f"No bins ≥ {collection_threshold}% full found in your area. Nothing to collect right now."
         if quiet_hours:
             detail += " Note: Glass/Metal bins are excluded during quiet hours (23:00–05:00 Islamabad time)."
         raise HTTPException(status_code=404, detail=detail)
@@ -722,7 +754,12 @@ def admin_delete_user(uid: str):
 @app.get("/admin/stats")
 def admin_stats(days: int = 30):
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    full_bins = list(db.collection("bins").where(filter=FieldFilter("fillLevel", ">", 70)).stream())
+    stats_warning_thresh, _ = _get_thresholds()
+    full_bins = list(
+        db.collection("bins")
+        .where(filter=FieldFilter("fillLevel", ">=", stats_warning_thresh))
+        .stream()
+    )
     active_workers = list(
         db.collection("users")
         .where(filter=FieldFilter("role", "==", "worker"))
