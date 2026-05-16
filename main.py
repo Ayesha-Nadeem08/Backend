@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
@@ -275,10 +275,10 @@ def read_root():
 @app.post("/analyze/")
 async def analyze_bin(
     image_file: UploadFile = File(...),
-    lat: Optional[float] = Form(default=None),
-    lng: Optional[float] = Form(default=None),
-    area: Optional[str] = Form(default=None),
-    bin_id: Optional[str] = Form(default=None),   # if provided, UPDATE existing doc instead of creating new
+    lat:    Optional[float] = Query(default=None),
+    lng:    Optional[float] = Query(default=None),
+    area:   Optional[str]   = Query(default=None),
+    bin_id: Optional[str]   = Query(default=None),
 ):
     # Bins are ONLY created through this endpoint — never seed them manually.
     print("\n========== STARTING AI ANALYSIS ==========")
@@ -647,9 +647,12 @@ def optimize_route(req: OptimizeRouteRequest):
             if dist_km > 10:
                 continue
 
-        # Waste type filter: worker only handles their assigned stream
+        # Waste type filter: worker only handles their assigned stream.
+        # "Mixed"/"All"/"Any"/"General" are wildcards meaning "collect everything".
         waste_type = data.get("wasteType", "")
-        if assigned_waste and waste_type.lower() != assigned_waste:
+        WILDCARD_WASTE = {"mixed", "all", "any", "general"}
+        if assigned_waste and assigned_waste not in WILDCARD_WASTE \
+                and waste_type.lower() != assigned_waste:
             continue
 
         # German noise regulation: no Glass or Metal collections at night
@@ -1226,6 +1229,30 @@ def clock_in(req: ClockInRequest):
     user_data = user_snap.to_dict()
     if user_data.get("shiftStatus") == "clocked_in":
         raise HTTPException(status_code=409, detail="already_clocked_in")
+
+    # If a scheduled shift exists for today, block clock-in before start time.
+    # Workers may clock in up to 5 minutes early; no restriction if no schedule exists.
+    now_pkt   = datetime.now(ZoneInfo("Asia/Karachi"))
+    today_str = now_pkt.strftime("%Y-%m-%d")
+    scheduled_today = list(
+        db.collection("shiftSchedules")
+        .where(filter=FieldFilter("workerId", "==", req.worker_id))
+        .where(filter=FieldFilter("scheduledDate", "==", today_str))
+        .where(filter=FieldFilter("status", "in", ["scheduled", "acknowledged"]))
+        .limit(1)
+        .stream()
+    )
+    if not scheduled_today:
+        raise HTTPException(status_code=409, detail="no_shift_scheduled")
+
+    start_str = scheduled_today[0].to_dict().get("startTime", "00:00")
+    try:
+        h, m = map(int, start_str.split(":"))
+        shift_start = now_pkt.replace(hour=h, minute=m, second=0, microsecond=0)
+        if now_pkt < shift_start - timedelta(minutes=5):
+            raise HTTPException(status_code=409, detail="shift_not_started")
+    except (ValueError, AttributeError):
+        pass  # unparseable time — don't block
 
     worker_name = f"{user_data.get('firstName', '')} {user_data.get('lastName', '')}".strip()
     now_utc     = datetime.now(timezone.utc)
