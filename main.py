@@ -1,5 +1,6 @@
 import os
 import io
+import base64
 import math
 import uuid
 import traceback
@@ -8,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
@@ -57,13 +58,21 @@ app.add_middleware(
 )
 
 # ── YOLO Models ───────────────────────────────────────────────────────────────
-print("Loading AI Models...")
-_orig_torch_load = torch.load
-torch.load = lambda *a, **kw: _orig_torch_load(*a, **{**kw, "weights_only": False})
-fill_model = YOLO("models/fill_model.pt")
-waste_model = YOLO("models/waste_model.pt")
-torch.load = _orig_torch_load
-print("Models loaded successfully!")
+_models: dict = {}
+
+def _load_models() -> None:
+    global _models
+    print("Loading AI models...")
+    _orig = torch.load
+    torch.load = lambda *a, **kw: _orig(*a, **{**kw, "weights_only": False})
+    industrial = Path("models/fill_model_industrial.pt")
+    _models["fill"]  = YOLO(str(industrial) if industrial.exists() else "models/fill_model.pt")
+    _models["waste"] = YOLO("models/waste_model.pt")
+    torch.load = _orig
+    source = "industrial" if industrial.exists() else "consumer"
+    print(f"Models loaded — fill: {source}, waste: ready")
+
+_load_models()
 
 FILL_LEVEL_MAP: dict[str, int] = {
     # ── Exact labels (as returned by model after .strip().title()) ────────────
@@ -150,6 +159,41 @@ class CreateUserRequest(BaseModel):
     assigned_area: str = ""
     assigned_waste_type: str = ""
 
+class UpdateUserRequest(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone: Optional[str] = None
+    role: Optional[str] = None
+    assigned_area: Optional[str] = None
+    assigned_waste_type: Optional[str] = None
+    password: Optional[str] = None   # if provided, updates Firebase Auth password
+
+class SkipStopRequest(BaseModel):
+    route_id:       str
+    bin_id:         str
+    worker_id:      str
+    exception_type: str   # "bin_inaccessible" | "bin_damaged" | "hazardous_material"
+    exception_note: str = ""
+
+class ClockInRequest(BaseModel):
+    worker_id: str
+
+class ClockOutRequest(BaseModel):
+    worker_id: str
+
+class ResolveExceptionRequest(BaseModel):
+    status:      str             # "resolved" | "escalated"
+    resolved_by: str = ""
+    notes:       Optional[str] = ""
+
+class ScheduleShiftRequest(BaseModel):
+    worker_id:      str
+    scheduled_date: str          # YYYY-MM-DD
+    start_time:     str          # HH:MM (24h)
+    end_time:       str          # HH:MM (24h)
+    note:           str = ""
+    created_by:     str = "admin"
+
 # ── Settings helper ───────────────────────────────────────────────────────────
 def _get_thresholds() -> tuple[int, int]:
     """Read warning and critical fill thresholds from Firestore settings/main.
@@ -231,10 +275,10 @@ def read_root():
 @app.post("/analyze/")
 async def analyze_bin(
     image_file: UploadFile = File(...),
-    lat: Optional[float] = None,
-    lng: Optional[float] = None,
-    area: Optional[str] = None,
-    bin_id: Optional[str] = None,   # if provided, UPDATE existing doc instead of creating new
+    lat: Optional[float] = Form(default=None),
+    lng: Optional[float] = Form(default=None),
+    area: Optional[str] = Form(default=None),
+    bin_id: Optional[str] = Form(default=None),   # if provided, UPDATE existing doc instead of creating new
 ):
     # Bins are ONLY created through this endpoint — never seed them manually.
     print("\n========== STARTING AI ANALYSIS ==========")
@@ -247,24 +291,32 @@ async def analyze_bin(
         print("Step 2: Running Fill Level Model...")
         fill_status = "Not Detected"
         fill_confidence = 0.0
-        fill_results = fill_model(image, conf=0.5)
+        fill_results = _models["fill"](image, conf=0.5)
         if len(fill_results[0].boxes) > 0:
             best = fill_results[0].boxes[0]
-            raw_label = fill_model.names[int(best.cls[0])]
+            raw_label = _models["fill"].names[int(best.cls[0])]
             fill_status = raw_label.strip().title()
             fill_confidence = round(float(best.conf[0]), 3)
         fill_level_int = _label_to_fill_int(fill_status)
         print(f"-> Fill Model OK: label='{fill_status}', level={fill_level_int}%, conf={fill_confidence}")
 
+        # ── Abort early: model found no bin in the image ──────────────────────
+        if fill_status == "Not Detected":
+            print("-> Detection failed: no bin found. Aborting without Firestore write.")
+            raise HTTPException(
+                status_code=422,
+                detail="no_bin_detected",
+            )
+
         detected_waste = []
         primary_waste_type = "Unknown"
 
-        if fill_status not in ("Not Detected", "Empty"):
+        if fill_status not in ("Empty",):
             print("Step 3: Running Waste Type Model...")
-            waste_results = waste_model(image, conf=0.5)
+            waste_results = _models["waste"](image, conf=0.5)
             for box in waste_results[0].boxes:
                 detected_waste.append({
-                    "type":       waste_model.names[int(box.cls[0])],
+                    "type":       _models["waste"].names[int(box.cls[0])],
                     "confidence": round(float(box.conf[0]), 3),
                     "coordinates": {
                         "x1": round(float(box.xyxy[0][0]), 1),
@@ -280,6 +332,15 @@ async def analyze_bin(
             print(f"-> Waste Model OK: primary='{primary_waste_type}', detections={len(detected_waste)}")
         else:
             print("Step 3: Skipped — no bin detected by fill model.")
+
+        # Step 3b: Build compressed thumbnail for Firestore image preview
+        print("Step 3b: Generating image thumbnail...")
+        thumb = image.copy()
+        thumb.thumbnail((640, 640))
+        thumb_buf = io.BytesIO()
+        thumb.save(thumb_buf, format="JPEG", quality=60)
+        image_preview_b64 = base64.b64encode(thumb_buf.getvalue()).decode("utf-8")
+        print(f"-> Thumbnail OK ({len(thumb_buf.getvalue())} bytes → {len(image_preview_b64)} chars base64)")
 
         print("Step 4: Writing to Firestore...")
         warning_thresh, critical_thresh = _get_thresholds()
@@ -305,9 +366,10 @@ async def analyze_bin(
             "area":          bin_area,
             "sector":        bin_area,
             "lastAnalyzed":  datetime.now(timezone.utc),
+            "imagePreview":  image_preview_b64,
         }
 
-        # Update existing bin if bin_id given, otherwise create a new document
+        # Update existing bin if bin_id given, otherwise create/update by lat+lng
         if bin_id:
             bin_ref = db.collection("bins").document(bin_id)
             if bin_ref.get().exists:
@@ -321,10 +383,24 @@ async def analyze_bin(
                 saved_bin_id = bin_id
                 print(f"-> Created bin with provided id: {saved_bin_id}")
         else:
-            new_doc = db.collection("bins").document()
-            saved_bin_id = new_doc.id
-            new_doc.set(bin_data)
-            print(f"-> Created new bin: {saved_bin_id}")
+            # No bin_id: use a deterministic document ID derived from the
+            # rounded lat/lng so the same coordinates always map to the same
+            # Firestore document — no query needed, no composite index required.
+            def _coord_seg(v: float) -> str:
+                return f"{v:.5f}".replace(".", "d").replace("-", "m")
+
+            bin_doc_id = f"bin_{_coord_seg(bin_lat)}_{_coord_seg(bin_lng)}"
+            bin_ref = db.collection("bins").document(bin_doc_id)
+            existing = bin_ref.get()
+            if existing.exists:
+                update_fields = {k: v for k, v in bin_data.items() if k not in ("isLocked",)}
+                bin_ref.update(update_fields)
+                saved_bin_id = bin_doc_id
+                print(f"-> Updated existing bin (same lat/lng): {saved_bin_id}")
+            else:
+                bin_ref.set(bin_data)
+                saved_bin_id = bin_doc_id
+                print(f"-> Created new bin: {saved_bin_id}")
 
         # --- SFR-017: FCM Push Notifications for Urgent Overflows ---
         if fill_level_int >= critical_thresh:
@@ -398,6 +474,99 @@ async def analyze_bin(
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
 
 
+# ── 1b. Re-scan an existing bin (no lat/lng needed) ──────────────────────────
+# POST /rescan-bin/{bin_id}  +  image_file (multipart)
+# Runs the same AI pipeline as /analyze/ but always updates the existing
+# document — lat, lng, area, isLocked, and routeId are never touched.
+@app.post("/rescan-bin/{bin_id}")
+async def rescan_bin(bin_id: str, image_file: UploadFile = File(...)):
+    print(f"\n========== RESCAN: {bin_id} ==========")
+    try:
+        # 1. Verify the bin exists and grab its preserved fields
+        bin_ref  = db.collection("bins").document(bin_id)
+        bin_snap = bin_ref.get()
+        if not bin_snap.exists:
+            raise HTTPException(status_code=404, detail=f"Bin '{bin_id}' not found.")
+        existing = bin_snap.to_dict()
+
+        # 2. Read + decode image
+        image_bytes = await image_file.read()
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        print(f"-> Image OK ({len(image_bytes)} bytes, size={image.size})")
+
+        # 3. Fill level model
+        fill_status    = "Not Detected"
+        fill_confidence = 0.0
+        fill_results   = _models["fill"](image, conf=0.5)
+        if len(fill_results[0].boxes) > 0:
+            best           = fill_results[0].boxes[0]
+            fill_status    = _models["fill"].names[int(best.cls[0])].strip().title()
+            fill_confidence = round(float(best.conf[0]), 3)
+        fill_level_int = _label_to_fill_int(fill_status)
+        print(f"-> Fill: '{fill_status}' ({fill_level_int}%, conf={fill_confidence})")
+
+        if fill_status == "Not Detected":
+            raise HTTPException(status_code=422, detail="no_bin_detected")
+
+        # 4. Waste type model (skip for Empty bins)
+        primary_waste_type = existing.get("wasteType", "Unknown")
+        detected_waste     = []
+        if fill_status not in ("Empty",):
+            waste_results = _models["waste"](image, conf=0.5)
+            for box in waste_results[0].boxes:
+                detected_waste.append({
+                    "type":       _models["waste"].names[int(box.cls[0])],
+                    "confidence": round(float(box.conf[0]), 3),
+                })
+            if detected_waste:
+                primary_waste_type = max(detected_waste, key=lambda w: w["confidence"])["type"]
+            print(f"-> Waste: '{primary_waste_type}'")
+
+        # 5. Thumbnail
+        thumb = image.copy()
+        thumb.thumbnail((640, 640))
+        buf = io.BytesIO()
+        thumb.save(buf, format="JPEG", quality=60)
+        image_preview_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        # 6. Status
+        warning_thresh, critical_thresh = _get_thresholds()
+        bin_status = (
+            "critical" if fill_level_int >= critical_thresh
+            else "warning" if fill_level_int >= warning_thresh
+            else "normal"
+        )
+
+        # 7. Update only AI-derived fields — preserve lat/lng/area/isLocked/routeId
+        bin_ref.update({
+            "fillStatus":    fill_status,
+            "fillLevel":     fill_level_int,
+            "wasteType":     primary_waste_type,
+            "aiConfidence":  fill_confidence,
+            "detectedWaste": detected_waste,
+            "imagePreview":  image_preview_b64,
+            "status":        bin_status,
+            "lastAnalyzed":  datetime.now(timezone.utc),
+        })
+        print(f"-> Updated bin {bin_id}")
+        print("========== RESCAN COMPLETE ==========\n")
+        return {
+            "success":      True,
+            "bin_id":       bin_id,
+            "fillStatus":   fill_status,
+            "fillLevel":    fill_level_int,
+            "wasteType":    primary_waste_type,
+            "aiConfidence": fill_confidence,
+            "status":       bin_status,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  2. ROUTING API — German Area-Based Assignment Model
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -450,6 +619,10 @@ def optimize_route(req: OptimizeRouteRequest):
         if data.get("isLocked", False):
             continue
 
+        # Safety: skip bins flagged as hazardous by a driver exception
+        if data.get("hasHazardousFlag", False):
+            continue
+
         lat = float(data.get("lat", 0))
         lng = float(data.get("lng", 0))
         if lat == 0.0 and lng == 0.0:
@@ -461,7 +634,13 @@ def optimize_route(req: OptimizeRouteRequest):
         # on the map.
         bin_area = data.get("area", data.get("sector", ""))
         if assigned_area:
-            if bin_area and bin_area != assigned_area:
+            # Case-insensitive hierarchy match: exact OR bin area ends with ", <assigned_area>".
+            # Lets a city-level worker ("Lahore") see sub-area bins
+            # ("Wahdat Colony, Lahore", "DHA, Lahore") without widening to
+            # completely unrelated areas.
+            _ba = bin_area.strip().lower()
+            _aa = assigned_area.strip().lower()
+            if not (_ba == _aa or _ba.endswith(f", {_aa}")):
                 continue
         else:
             dist_km = _haversine_km(req.depot_lat, req.depot_lng, lat, lng)
@@ -607,14 +786,17 @@ def complete_stop(req: CompleteStopRequest):
         update_payload["completedAt"] = now_utc
     route_ref.update(update_payload)
 
-    # Unlock the bin and reset fill level
-    db.collection("bins").document(req.bin_id).update({
-        "fillLevel":     0,
-        "fillStatus":    "Empty",
-        "isLocked":      False,
-        "routeId":       firestore.DELETE_FIELD,
-        "lastCollected": now_utc,
-    })
+    # Unlock the bin and reset fill level (bin may have been deleted by admin — skip gracefully)
+    bin_doc_ref = db.collection("bins").document(req.bin_id)
+    if bin_doc_ref.get().exists:
+        bin_doc_ref.update({
+            "fillLevel":     0,
+            "fillStatus":    "Empty",
+            "status":        "normal",
+            "isLocked":      False,
+            "routeId":       firestore.DELETE_FIELD,
+            "lastCollected": now_utc,
+        })
 
     # Write pickup log for analytics — drives the Collections page
     log_id = str(uuid.uuid4())
@@ -708,6 +890,24 @@ def report_anomaly(req: ReportAnomalyRequest):
 @app.post("/admin/create-user")
 def admin_create_user(req: CreateUserRequest):
     """Creates a Firebase Auth account AND the corresponding Firestore user document."""
+    # One worker per area constraint
+    if req.role == "worker" and req.assigned_area.strip():
+        area_norm = req.assigned_area.strip().lower()
+        existing_workers = db.collection("users").where(
+            filter=FieldFilter("role", "==", "worker")
+        ).stream()
+        for w in existing_workers:
+            w_data = w.to_dict()
+            if w_data.get("assignedArea", "").strip().lower() == area_norm:
+                w_name = (
+                    f"{w_data.get('firstName', '')} {w_data.get('lastName', '')}".strip()
+                    or w_data.get("email", "another worker")
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Area '{req.assigned_area.strip()}' is already assigned to {w_name}. Each area can only have one worker.",
+                )
+
     display_name = f"{req.first_name} {req.last_name}".strip()
     try:
         user_record = fb_auth.create_user(
@@ -758,6 +958,91 @@ def admin_delete_user(uid: str):
     return {"success": True, "uid": uid}
 
 
+# ── Admin: Update user (Firestore + optionally Firebase Auth password) ────────
+@app.patch("/admin/update-user/{uid}")
+def admin_update_user(uid: str, req: UpdateUserRequest):
+    user_doc = db.collection("users").document(uid).get()
+    if not user_doc.exists:
+        raise HTTPException(status_code=404, detail=f"User '{uid}' not found.")
+
+    current = user_doc.to_dict()
+    new_role = req.role if req.role is not None else current.get("role", "worker")
+
+    # One-worker-per-area constraint (skip current user)
+    if new_role == "worker" and req.assigned_area is not None and req.assigned_area.strip():
+        area_norm = req.assigned_area.strip().lower()
+        for w in db.collection("users").where(filter=FieldFilter("role", "==", "worker")).stream():
+            if w.id == uid:
+                continue
+            w_data = w.to_dict()
+            if w_data.get("assignedArea", "").strip().lower() == area_norm:
+                w_name = (
+                    f"{w_data.get('firstName', '')} {w_data.get('lastName', '')}".strip()
+                    or w_data.get("email", "another worker")
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Area '{req.assigned_area.strip()}' is already assigned to {w_name}.",
+                )
+
+    updates: dict = {}
+    if req.first_name is not None:
+        updates["firstName"] = req.first_name.strip()
+    if req.last_name is not None:
+        updates["lastName"] = req.last_name.strip()
+    if req.phone is not None:
+        updates["phoneNumber"] = req.phone.strip()
+    if req.role is not None:
+        updates["role"] = req.role
+        if req.role != "worker":
+            updates["assignedArea"] = ""
+            updates["assignedWasteType"] = ""
+    if req.assigned_area is not None and new_role == "worker":
+        updates["assignedArea"] = req.assigned_area.strip()
+    if req.assigned_waste_type is not None and new_role == "worker":
+        updates["assignedWasteType"] = req.assigned_waste_type
+
+    if updates:
+        db.collection("users").document(uid).update(updates)
+
+    if req.password and len(req.password) >= 6:
+        try:
+            fb_auth.update_user(uid, password=req.password)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Password update failed: {e}")
+
+    return {"success": True, "uid": uid}
+
+
+# ── Admin: Delete bin + remove from active routes ─────────────────────────────
+@app.delete("/admin/delete-bin/{bin_id}")
+def admin_delete_bin(bin_id: str):
+    """Deletes a bin document and scrubs it from every active/pending route."""
+    # 1. Remove bin from any routes that reference it
+    affected_routes = list(
+        db.collection("routes")
+        .where(filter=FieldFilter("status", "in", ["active", "pending"]))
+        .stream()
+    )
+    for route_doc in affected_routes:
+        r_data = route_doc.to_dict()
+        stops = r_data.get("stops", [])
+        new_stops = [s for s in stops if s.get("binId") != bin_id]
+        if len(new_stops) != len(stops):
+            new_total = len(new_stops)
+            completed = sum(1 for s in new_stops if s.get("completed", False))
+            new_status = "completed" if (new_total > 0 and completed >= new_total) else r_data.get("status", "active")
+            route_doc.reference.update({
+                "stops":          new_stops,
+                "totalStops":     new_total,
+                "status":         new_status,
+            })
+
+    # 2. Delete the bin document itself
+    db.collection("bins").document(bin_id).delete()
+    return {"success": True, "bin_id": bin_id}
+
+
 # ── Admin KPI Dashboard ───────────────────────────────────────────────────────
 @app.get("/admin/stats")
 def admin_stats(days: int = 30):
@@ -792,6 +1077,8 @@ def admin_stats(days: int = 30):
     efficiency  = round(done_stops / total_stops * 100, 1) if total_stops > 0 else 0.0
 
     pending_anomalies = list(db.collection("anomalies").where(filter=FieldFilter("status", "==", "pending")).stream())
+    clocked_in_users  = list(db.collection("users").where(filter=FieldFilter("shiftStatus", "==", "clocked_in")).stream())
+    open_exceptions   = list(db.collection("routeExceptions").where(filter=FieldFilter("status", "==", "open")).stream())
 
     return {
         "success": True,
@@ -803,8 +1090,489 @@ def admin_stats(days: int = 30):
             "totalCarbonKg":       total_carbon,
             "fleetEfficiency":     efficiency,
             "pendingAnomalies":    len(pending_anomalies),
+            "activeShifts":        len(clocked_in_users),
+            "openExceptions":      len(open_exceptions),
         },
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PHASE 3 — EXCEPTION HANDLING, SHIFT MANAGEMENT, MODEL HOT-SWAP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/skip-stop")
+def skip_stop(req: SkipStopRequest):
+    now_utc   = datetime.now(timezone.utc)
+    route_ref = db.collection("routes").document(req.route_id)
+    route_snap = route_ref.get()
+    if not route_snap.exists:
+        raise HTTPException(status_code=404, detail=f"Route '{req.route_id}' not found.")
+
+    route_data = route_snap.to_dict()
+    stops = list(route_data.get("stops", []))
+
+    bin_area, bin_lat, bin_lng = "", 0.0, 0.0
+    found = False
+    for stop in stops:
+        if stop.get("binId") == req.bin_id:
+            if stop.get("skipped", False):
+                raise HTTPException(status_code=409, detail="already_skipped")
+            if stop.get("completed", False):
+                raise HTTPException(status_code=409, detail="already_completed")
+            stop["skipped"]       = True
+            stop["exceptionType"] = req.exception_type
+            stop["exceptionNote"] = req.exception_note
+            stop["exceptionAt"]   = now_utc
+            bin_area = stop.get("area", "")
+            bin_lat  = float(stop.get("lat", 0))
+            bin_lng  = float(stop.get("lng", 0))
+            found = True
+            break
+
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Bin '{req.bin_id}' not found in route stops.")
+
+    skipped_stops  = route_data.get("skippedStops", 0) + 1
+    completed_done = route_data.get("completedStops", 0)
+    total_stops    = route_data.get("totalStops", 0)
+    new_status     = "completed" if (completed_done + skipped_stops) >= total_stops else "active"
+
+    update: dict = {"stops": stops, "skippedStops": skipped_stops, "status": new_status}
+    if new_status == "completed":
+        update["completedAt"] = now_utc
+
+    # Detect route abandonment: route completed with zero collections (all stops skipped)
+    is_abandoned = (
+        new_status == "completed"
+        and completed_done == 0
+        and skipped_stops == total_stops
+        and total_stops > 0
+    )
+    if is_abandoned:
+        update["abandoned"] = True
+
+    route_ref.update(update)
+
+    # Write abandonment alert to Firestore so Dashboard can surface it immediately
+    if is_abandoned:
+        # worker_name is resolved later for the exception doc — read it now
+        _ws = db.collection("users").document(req.worker_id).get()
+        _wn = ""
+        if _ws.exists:
+            _wd = _ws.to_dict()
+            _wn = f"{_wd.get('firstName', '')} {_wd.get('lastName', '')}".strip()
+        alert_id = str(uuid.uuid4())
+        db.collection("alerts").document(alert_id).set({
+            "alertId":    alert_id,
+            "type":       "route_abandoned",
+            "routeId":    req.route_id,
+            "workerId":   req.worker_id,
+            "workerName": _wn or req.worker_id,
+            "totalStops": total_stops,
+            "area":       route_data.get("assignedArea", ""),
+            "status":     "unread",
+            "createdAt":  now_utc,
+        })
+
+    # Unlock bin (keep fillLevel — not yet collected)
+    bin_ref = db.collection("bins").document(req.bin_id)
+    if bin_ref.get().exists:
+        bin_update: dict = {"isLocked": False, "routeId": firestore.DELETE_FIELD}
+        if req.exception_type == "hazardous_material":
+            bin_update["hasHazardousFlag"]     = True
+            bin_update["hazardousFlaggedAt"]   = now_utc
+        bin_ref.update(bin_update)
+
+    # Resolve worker name for the exception doc
+    worker_snap = db.collection("users").document(req.worker_id).get()
+    worker_data = worker_snap.to_dict() if worker_snap.exists else {}
+    worker_name = f"{worker_data.get('firstName', '')} {worker_data.get('lastName', '')}".strip() or req.worker_id
+
+    exception_id = str(uuid.uuid4())
+    db.collection("routeExceptions").document(exception_id).set({
+        "exceptionId":   exception_id,
+        "routeId":       req.route_id,
+        "binId":         req.bin_id,
+        "workerId":      req.worker_id,
+        "workerName":    worker_name,
+        "exceptionType": req.exception_type,
+        "exceptionNote": req.exception_note,
+        "area":          bin_area,
+        "binLat":        bin_lat,
+        "binLng":        bin_lng,
+        "status":        "open",
+        "resolvedBy":    None,
+        "resolvedAt":    None,
+        "createdAt":     now_utc,
+    })
+
+    return {
+        "success":         True,
+        "exception_id":    exception_id,
+        "route_status":    new_status,
+        "completed_stops": completed_done,
+        "skipped_stops":   skipped_stops,
+        "total_stops":     total_stops,
+    }
+
+
+@app.post("/clock-in")
+def clock_in(req: ClockInRequest):
+    user_ref  = db.collection("users").document(req.worker_id)
+    user_snap = user_ref.get()
+    if not user_snap.exists:
+        raise HTTPException(status_code=404, detail=f"Worker '{req.worker_id}' not found.")
+
+    user_data = user_snap.to_dict()
+    if user_data.get("shiftStatus") == "clocked_in":
+        raise HTTPException(status_code=409, detail="already_clocked_in")
+
+    worker_name = f"{user_data.get('firstName', '')} {user_data.get('lastName', '')}".strip()
+    now_utc     = datetime.now(timezone.utc)
+    shift_id    = str(uuid.uuid4())
+
+    db.collection("shifts").document(shift_id).set({
+        "shiftId":            shift_id,
+        "workerId":           req.worker_id,
+        "workerName":         worker_name,
+        "assignedArea":       user_data.get("assignedArea", ""),
+        "assignedWasteType":  user_data.get("assignedWasteType", ""),
+        "clockInTime":        now_utc,
+        "clockOutTime":       None,
+        "totalDurationMinutes": None,
+        "routesCompleted":    0,
+        "collectionsCompleted": 0,
+        "status":             "active",
+    })
+
+    user_ref.update({
+        "shiftStatus":    "clocked_in",
+        "currentShiftId": shift_id,
+        "lastClockIn":    now_utc,
+    })
+
+    # Mark today's scheduled shift as acknowledged
+    today_str = now_utc.strftime("%Y-%m-%d")
+    scheduled = list(
+        db.collection("shiftSchedules")
+        .where(filter=FieldFilter("workerId", "==", req.worker_id))
+        .where(filter=FieldFilter("scheduledDate", "==", today_str))
+        .where(filter=FieldFilter("status", "==", "scheduled"))
+        .limit(1)
+        .stream()
+    )
+    if scheduled:
+        scheduled[0].reference.update({"status": "acknowledged"})
+
+    return {"success": True, "shift_id": shift_id, "clock_in_time": now_utc.isoformat()}
+
+
+@app.post("/clock-out")
+def clock_out(req: ClockOutRequest):
+    user_ref  = db.collection("users").document(req.worker_id)
+    user_snap = user_ref.get()
+    if not user_snap.exists:
+        raise HTTPException(status_code=404, detail=f"Worker '{req.worker_id}' not found.")
+
+    user_data = user_snap.to_dict()
+    shift_id  = user_data.get("currentShiftId")
+    if not shift_id:
+        raise HTTPException(status_code=409, detail="not_clocked_in")
+
+    shift_ref  = db.collection("shifts").document(shift_id)
+    shift_snap = shift_ref.get()
+    if not shift_snap.exists:
+        raise HTTPException(status_code=404, detail=f"Shift '{shift_id}' not found.")
+
+    shift_data = shift_snap.to_dict()
+    clock_in_ts = shift_data.get("clockInTime")
+    now_utc     = datetime.now(timezone.utc)
+
+    duration_mins = 0
+    if clock_in_ts:
+        if hasattr(clock_in_ts, "replace"):
+            clock_in_dt = clock_in_ts.replace(tzinfo=timezone.utc) if clock_in_ts.tzinfo is None else clock_in_ts
+        else:
+            clock_in_dt = clock_in_ts
+        duration_mins = int((now_utc - clock_in_dt).total_seconds() / 60)
+
+    # Count routes completed since clock-in
+    routes_done = list(
+        db.collection("routes")
+        .where(filter=FieldFilter("driverId", "==", req.worker_id))
+        .where(filter=FieldFilter("status", "==", "completed"))
+        .stream()
+    )
+    if clock_in_ts:
+        routes_done = [r for r in routes_done if r.to_dict().get("createdAt", now_utc) >= clock_in_ts]
+    routes_count = len(routes_done)
+
+    # Count pickups since clock-in
+    logs_done = list(
+        db.collection("pickupLogs")
+        .where(filter=FieldFilter("workerId", "==", req.worker_id))
+        .stream()
+    )
+    if clock_in_ts:
+        logs_done = [l for l in logs_done if l.to_dict().get("completedAt", now_utc) >= clock_in_ts]
+    collections_count = len(logs_done)
+
+    shift_ref.update({
+        "clockOutTime":          now_utc,
+        "totalDurationMinutes":  duration_mins,
+        "routesCompleted":       routes_count,
+        "collectionsCompleted":  collections_count,
+        "status":                "completed",
+    })
+
+    user_ref.update({
+        "shiftStatus":    "clocked_out",
+        "currentShiftId": None,
+        "lastClockOut":   now_utc,
+    })
+
+    # Mark today's scheduled shift as completed
+    today_str = now_utc.strftime("%Y-%m-%d")
+    scheduled = list(
+        db.collection("shiftSchedules")
+        .where(filter=FieldFilter("workerId", "==", req.worker_id))
+        .where(filter=FieldFilter("scheduledDate", "==", today_str))
+        .where(filter=FieldFilter("status", "in", ["scheduled", "acknowledged"]))
+        .limit(1)
+        .stream()
+    )
+    if scheduled:
+        scheduled[0].reference.update({"status": "completed"})
+
+    return {
+        "success":              True,
+        "shift_id":             shift_id,
+        "duration_minutes":     duration_mins,
+        "routes_completed":     routes_count,
+        "collections_completed": collections_count,
+    }
+
+
+@app.get("/worker/shift-status/{worker_id}")
+def worker_shift_status(worker_id: str):
+    snap = db.collection("users").document(worker_id).get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail=f"Worker '{worker_id}' not found.")
+    data = snap.to_dict()
+    clock_in_ts = data.get("lastClockIn")
+    return {
+        "is_clocked_in": data.get("shiftStatus") == "clocked_in",
+        "shift_id":      data.get("currentShiftId"),
+        "clock_in_time": clock_in_ts.isoformat() if clock_in_ts and hasattr(clock_in_ts, "isoformat") else None,
+    }
+
+
+@app.get("/admin/shifts")
+def admin_shifts(date: Optional[str] = None, worker_id: Optional[str] = None,
+                 status: Optional[str] = None, limit: int = 50):
+    limit = min(limit, 200)
+    q = db.collection("shifts").order_by("clockInTime", direction=firestore.Query.DESCENDING)
+
+    if status:
+        q = db.collection("shifts").where(filter=FieldFilter("status", "==", status)).order_by("clockInTime", direction=firestore.Query.DESCENDING)
+
+    if worker_id:
+        q = db.collection("shifts").where(filter=FieldFilter("workerId", "==", worker_id)).order_by("clockInTime", direction=firestore.Query.DESCENDING)
+
+    docs = [d.to_dict() for d in q.limit(limit).stream()]
+
+    if date:
+        try:
+            day_start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            day_end   = day_start + timedelta(days=1)
+            docs = [
+                d for d in docs
+                if d.get("clockInTime") and day_start <= d["clockInTime"].replace(tzinfo=timezone.utc) < day_end
+            ]
+        except ValueError:
+            pass
+
+    return {"success": True, "shifts": docs, "count": len(docs)}
+
+
+@app.get("/admin/exceptions")
+def admin_exceptions(status: Optional[str] = "open", worker_id: Optional[str] = None,
+                     area: Optional[str] = None, exception_type: Optional[str] = None,
+                     limit: int = 50):
+    limit = min(limit, 200)
+    if status:
+        q = (db.collection("routeExceptions")
+             .where(filter=FieldFilter("status", "==", status))
+             .order_by("createdAt", direction=firestore.Query.DESCENDING)
+             .limit(limit))
+    else:
+        q = (db.collection("routeExceptions")
+             .order_by("createdAt", direction=firestore.Query.DESCENDING)
+             .limit(limit))
+
+    docs = [d.to_dict() for d in q.stream()]
+
+    if worker_id:
+        docs = [d for d in docs if d.get("workerId") == worker_id]
+    if area:
+        docs = [d for d in docs if area.lower() in d.get("area", "").lower()]
+    if exception_type:
+        docs = [d for d in docs if d.get("exceptionType") == exception_type]
+
+    return {"success": True, "exceptions": docs, "count": len(docs)}
+
+
+@app.patch("/admin/exceptions/{exception_id}")
+def resolve_exception(exception_id: str, req: ResolveExceptionRequest):
+    ref  = db.collection("routeExceptions").document(exception_id)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail=f"Exception '{exception_id}' not found.")
+
+    update: dict = {"status": req.status}
+    if req.status in ("resolved", "escalated"):
+        update["resolvedBy"] = req.resolved_by
+        update["resolvedAt"] = datetime.now(timezone.utc)
+    if req.notes:
+        update["notes"] = req.notes
+    ref.update(update)
+    return {"success": True, "exception_id": exception_id, "new_status": req.status}
+
+
+@app.post("/admin/upload-model")
+async def upload_model(
+    model_file:  UploadFile = File(...),
+    model_type:  str        = Form(...),   # "fill" | "waste"
+    version_tag: str        = Form(...),
+):
+    if model_type not in ("fill", "waste"):
+        raise HTTPException(status_code=400, detail="model_type must be 'fill' or 'waste'.")
+    if not model_file.filename.endswith(".pt"):
+        raise HTTPException(status_code=400, detail="Only .pt files are accepted.")
+
+    models_dir  = Path("models")
+    pending_path = models_dir / f"{model_type}_model_pending.pt"
+    final_path   = models_dir / f"{model_type}_model.pt"
+    backup_path  = models_dir / f"{model_type}_model_backup.pt"
+
+    # Save upload to staging path
+    content = await model_file.read()
+    pending_path.write_bytes(content)
+
+    # Validate with a single test inference
+    try:
+        _orig = torch.load
+        torch.load = lambda *a, **kw: _orig(*a, **{**kw, "weights_only": False})
+        test_model = YOLO(str(pending_path))
+        torch.load = _orig
+
+        test_img_path = next(Path("asset/bins").glob("*.jpg"), None) if Path("asset/bins").exists() else None
+        conf_score = 0.0
+        if test_img_path:
+            test_img = Image.open(test_img_path).convert("RGB")
+            result   = test_model(test_img, conf=0.1)
+            if result and len(result[0].boxes) > 0:
+                conf_score = round(float(result[0].boxes[0].conf[0]), 3)
+    except Exception as e:
+        pending_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail=f"Model validation failed: {e}")
+
+    # Promote to active: keep old as backup
+    if final_path.exists():
+        final_path.replace(backup_path)
+    pending_path.replace(final_path)
+
+    # Reload models into memory
+    _load_models()
+
+    # Update Firestore settings
+    field = "fillModelVersion" if model_type == "fill" else "wasteModelVersion"
+    db.collection("settings").document("main").set(
+        {field: version_tag, "lastModelUpdate": datetime.now(timezone.utc)},
+        merge=True,
+    )
+
+    return {"success": True, "model_type": model_type, "version": version_tag, "test_confidence": conf_score}
+
+
+@app.post("/admin/reload-models")
+def reload_models_endpoint():
+    _load_models()
+    db.collection("settings").document("main").set(
+        {"lastModelUpdate": datetime.now(timezone.utc)}, merge=True
+    )
+    return {"success": True, "models_loaded": list(_models.keys())}
+
+
+# ── Shift Scheduling ──────────────────────────────────────────────────────────
+
+@app.post("/admin/schedule-shift")
+def admin_schedule_shift(req: ScheduleShiftRequest):
+    worker_snap = db.collection("users").document(req.worker_id).get()
+    if not worker_snap.exists:
+        raise HTTPException(status_code=404, detail=f"Worker '{req.worker_id}' not found.")
+
+    worker = worker_snap.to_dict()
+    worker_name = f"{worker.get('firstName', '')} {worker.get('lastName', '')}".strip()
+
+    schedule_id = str(uuid.uuid4())
+    db.collection("shiftSchedules").document(schedule_id).set({
+        "scheduleId":       schedule_id,
+        "workerId":         req.worker_id,
+        "workerName":       worker_name,
+        "assignedArea":     worker.get("assignedArea", ""),
+        "assignedWasteType":worker.get("assignedWasteType", ""),
+        "scheduledDate":    req.scheduled_date,
+        "startTime":        req.start_time,
+        "endTime":          req.end_time,
+        "note":             req.note,
+        "status":           "scheduled",
+        "createdBy":        req.created_by,
+        "createdAt":        datetime.now(timezone.utc),
+    })
+
+    fcm_token = worker.get("fcmToken", "")
+    area = worker.get("assignedArea", "your area")
+    _send_fcm(
+        token=fcm_token,
+        title="Shift Scheduled",
+        body=f"Your shift on {req.scheduled_date} starts at {req.start_time}. Report to {area}.",
+    )
+
+    return {"success": True, "schedule_id": schedule_id}
+
+
+@app.get("/admin/shift-schedules")
+def admin_shift_schedules(worker_id: Optional[str] = None, date: Optional[str] = None,
+                          status: Optional[str] = None, limit: int = 50):
+    limit = min(limit, 200)
+    q = db.collection("shiftSchedules").order_by("scheduledDate", direction=firestore.Query.DESCENDING)
+
+    if worker_id:
+        q = db.collection("shiftSchedules").where(
+            filter=FieldFilter("workerId", "==", worker_id)
+        ).order_by("scheduledDate", direction=firestore.Query.DESCENDING)
+
+    if status:
+        q = db.collection("shiftSchedules").where(
+            filter=FieldFilter("status", "==", status)
+        ).order_by("scheduledDate", direction=firestore.Query.DESCENDING)
+
+    docs = [d.to_dict() for d in q.limit(limit).stream()]
+
+    if date:
+        docs = [d for d in docs if d.get("scheduledDate") == date]
+
+    return {"success": True, "schedules": docs, "count": len(docs)}
+
+
+@app.delete("/admin/shift-schedules/{schedule_id}")
+def admin_delete_schedule(schedule_id: str):
+    ref = db.collection("shiftSchedules").document(schedule_id)
+    if not ref.get().exists:
+        raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found.")
+    ref.delete()
+    return {"success": True, "schedule_id": schedule_id}
 
 
 # ── Debug / Step-by-step test endpoint ───────────────────────────────────────
@@ -823,12 +1591,12 @@ async def test_image(image_file: UploadFile = File(...)):
     except Exception as e:
         return {"failed_at": "step2_pil", "error": str(e)}
     try:
-        fill_results = fill_model(image)
+        fill_results = _models["fill"](image)
         results["step3_fill_model"] = f"OK — {len(fill_results[0].boxes)} boxes"
     except Exception as e:
         return {"failed_at": "step3_fill_model", "error": str(e)}
     try:
-        waste_results = waste_model(image)
+        waste_results = _models["waste"](image)
         results["step4_waste_model"] = f"OK — {len(waste_results[0].boxes)} boxes"
     except Exception as e:
         return {"failed_at": "step4_waste_model", "error": str(e)}
