@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import base64
 import math
 import uuid
@@ -257,10 +258,9 @@ def _recompute_all_bin_statuses() -> tuple[int, list[str]]:
 
 def _find_workers_for_area(bin_area: str) -> list[tuple[str, dict]]:
     """Return [(worker_id, worker_data), ...] for workers whose assignedArea
-    matches the given bin area using the same hierarchy rule the rest of the
-    app uses (exact OR bin_area ends with ', <worker_area>'). Used to route
-    orphan-bin notifications to the right driver when no active route exists
-    in that area yet."""
+    matches the given bin area. Uses the canonical word-boundary hierarchy
+    rule shared with the worker app (utils/area_match.dart) and the route
+    optimizer above."""
     if not bin_area:
         return []
     _ba = bin_area.strip().lower()
@@ -273,7 +273,9 @@ def _find_workers_for_area(bin_area: str) -> list[tuple[str, dict]]:
         wa = (w_data.get("assignedArea") or "").strip().lower()
         if not wa:
             continue
-        if _ba == wa or _ba.endswith(f", {wa}"):
+        ba_in_wa = bool(re.search(r"\b" + re.escape(_ba) + r"\b", wa))
+        wa_in_ba = bool(re.search(r"\b" + re.escape(wa) + r"\b", _ba))
+        if _ba == wa or wa_in_ba or ba_in_wa:
             out.append((w.id, w_data))
     return out
 
@@ -782,15 +784,20 @@ def optimize_route(req: OptimizeRouteRequest):
         # Unassigned workers (no assignedArea) fall back to a 10 km proximity
         # filter centred on their depot GPS so the route matches what is shown
         # on the map.
-        bin_area = data.get("area", data.get("sector", ""))
+        #
+        # Must stay in sync with CleanCore/lib/utils/area_match.dart.
+        # Worker app reads `area` first, falls back to `sector` only when
+        # `area` is null — match that here so admin edits stay consistent.
+        bin_area = data.get("area") or data.get("sector") or ""
         if assigned_area:
-            # Case-insensitive hierarchy match: exact OR bin area ends with ", <assigned_area>".
-            # Lets a city-level worker ("Lahore") see sub-area bins
-            # ("Wahdat Colony, Lahore", "DHA, Lahore") without widening to
-            # completely unrelated areas.
             _ba = bin_area.strip().lower()
             _aa = assigned_area.strip().lower()
-            if not (_ba == _aa or _ba.endswith(f", {_aa}")):
+            if not _ba:
+                # Bin has no area set — hide from assigned workers (canonical rule).
+                continue
+            ba_matches_aa = bool(re.search(r"\b" + re.escape(_aa) + r"\b", _ba))
+            aa_matches_ba = bool(re.search(r"\b" + re.escape(_ba) + r"\b", _aa))
+            if not (_ba == _aa or ba_matches_aa or aa_matches_ba):
                 continue
         else:
             dist_km = _haversine_km(req.depot_lat, req.depot_lng, lat, lng)
@@ -1086,8 +1093,11 @@ def admin_create_user(req: CreateUserRequest):
         "collections":       0,
         "routes":            0,
         "profilePicture":    "",
-        "assignedArea":      req.assigned_area if req.role == "worker" else "",
-        "assignedWasteType": req.assigned_waste_type if req.role == "worker" else "",
+        # Trim so the worker app's exact-match filter always succeeds even if
+        # the admin form somehow forwards padding (must stay byte-for-byte
+        # consistent with the bin's `area` value).
+        "assignedArea":      req.assigned_area.strip() if req.role == "worker" else "",
+        "assignedWasteType": req.assigned_waste_type.strip() if req.role == "worker" else "",
         "createdAt":         datetime.now(timezone.utc),
     })
     return {"success": True, "uid": uid, "email": req.email}
