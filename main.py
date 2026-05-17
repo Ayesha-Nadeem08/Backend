@@ -197,20 +197,210 @@ class ScheduleShiftRequest(BaseModel):
 # ── Settings helper ───────────────────────────────────────────────────────────
 def _get_thresholds() -> tuple[int, int]:
     """Read warning and critical fill thresholds from Firestore settings/main.
-    Admin Panel saves these via the Settings → General → Collection Settings sliders.
-    Falls back to (70, 90) if the document doesn't exist or a read error occurs."""
+    Falls back to (70, 90) if the document doesn't exist or a read error occurs.
+    Admin Panel saves these via /admin/save-thresholds."""
     try:
         snap = db.collection("settings").document("main").get()
         if snap.exists:
             data     = snap.to_dict() or {}
             warning  = int(data.get("warningThreshold",  70))
             critical = int(data.get("criticalThreshold", 90))
-            # Basic sanity: warning must be strictly less than critical
             if 0 < warning < critical <= 100:
                 return warning, critical
     except Exception as e:
         print(f"[settings] Could not read thresholds, using defaults: {e}")
     return 70, 90
+
+
+def _classify_status(fill_level: int, warning: int, critical: int) -> str:
+    """Map a fill level to a status label using the given thresholds."""
+    if fill_level >= critical:
+        return "critical"
+    if fill_level >= warning:
+        return "warning"
+    return "normal"
+
+
+def _recompute_all_bin_statuses() -> tuple[int, list[str]]:
+    """Re-score every bin's `status` field against current thresholds.
+
+    Returns a tuple of (updated_count, newly_critical_unlocked_bin_ids). The
+    second list is consumed by /admin/save-thresholds to drive the same
+    urgent-attach behaviour /analyze/ uses, so a threshold drop that flips a
+    bin to critical attaches it to a matching route just like a fresh scan would.
+    """
+    warning, critical = _get_thresholds()
+    updated = 0
+    newly_critical: list[str] = []
+    batch = db.batch()
+    batch_size = 0
+    for snap in db.collection("bins").stream():
+        data = snap.to_dict() or {}
+        fill_level = int(data.get("fillLevel", 0))
+        new_status = _classify_status(fill_level, warning, critical)
+        old_status = data.get("status")
+        if new_status != old_status:
+            batch.update(snap.reference, {"status": new_status})
+            batch_size += 1
+            updated += 1
+            if new_status == "critical" and not data.get("isLocked", False):
+                newly_critical.append(snap.id)
+            # Firestore caps a single batch at 500 ops.
+            if batch_size >= 400:
+                batch.commit()
+                batch = db.batch()
+                batch_size = 0
+    if batch_size > 0:
+        batch.commit()
+    return updated, newly_critical
+
+
+def _find_workers_for_area(bin_area: str) -> list[tuple[str, dict]]:
+    """Return [(worker_id, worker_data), ...] for workers whose assignedArea
+    matches the given bin area using the same hierarchy rule the rest of the
+    app uses (exact OR bin_area ends with ', <worker_area>'). Used to route
+    orphan-bin notifications to the right driver when no active route exists
+    in that area yet."""
+    if not bin_area:
+        return []
+    _ba = bin_area.strip().lower()
+    out: list[tuple[str, dict]] = []
+    workers = db.collection("users").where(
+        filter=FieldFilter("role", "==", "worker")
+    ).stream()
+    for w in workers:
+        w_data = w.to_dict() or {}
+        wa = (w_data.get("assignedArea") or "").strip().lower()
+        if not wa:
+            continue
+        if _ba == wa or _ba.endswith(f", {wa}"):
+            out.append((w.id, w_data))
+    return out
+
+
+def _notify_orphan_critical_bin(bin_id: str, bin_data: dict) -> int:
+    """FCM workers responsible for an orphan critical bin — i.e. one that's
+    full but has no active route to ride on yet. Each notified worker can then
+    start a route to pick it up. Returns the number of FCMs sent."""
+    bin_area = (bin_data.get("area") or bin_data.get("sector") or "").strip()
+    fill_level = int(bin_data.get("fillLevel", 0))
+    sent = 0
+    for _worker_id, w_data in _find_workers_for_area(bin_area):
+        token = w_data.get("fcmToken")
+        if not token:
+            continue
+        _send_fcm(
+            token=token,
+            title="🚨 Urgent Bin — Start a Route",
+            body=f"A critical bin in {bin_area} ({fill_level}% full) "
+                 f"needs collection. Generate a route to pick it up.",
+        )
+        sent += 1
+    return sent
+
+
+def _try_attach_urgent_bin(
+    bin_id: str,
+    bin_data: dict,
+    notify_orphan: bool = True,
+) -> Optional[dict]:
+    """Attach a critical, unlocked bin to a matching active route.
+
+    'Matching' means the route's assignedArea equals or is a parent of the
+    bin's area (same hierarchy rule used by /optimize-route) AND the route's
+    assignedWasteType matches the bin's wasteType (wildcards 'Mixed' / 'All' /
+    'Any' / 'General' accept anything).
+
+    On attach: mutates Firestore (locks the bin, appends to the route's stops,
+    bumps totalStops, fires an FCM to the driver) and returns the matched
+    route's dict.
+
+    On no-match: returns None. If `notify_orphan` is True (default), also
+    sends an "urgent bin — start a route" FCM to whichever worker is assigned
+    to the bin's area so they know to generate a route. Set notify_orphan to
+    False when the caller will handle batched notifications itself (e.g.
+    /admin/save-thresholds, which may flip many bins to critical at once and
+    wants to send one summary per worker instead of one per bin).
+
+    Used by both /analyze/ (newly-scanned critical bin) and
+    /admin/save-thresholds (existing bin promoted to critical by a threshold
+    change), so the two paths behave symmetrically.
+    """
+    bin_area  = (bin_data.get("area") or bin_data.get("sector") or "").strip()
+    bin_waste = (bin_data.get("wasteType") or "").strip().lower()
+    fill_level = int(bin_data.get("fillLevel", 0))
+    bin_lat = float(bin_data.get("lat", 0.0) or 0.0)
+    bin_lng = float(bin_data.get("lng", 0.0) or 0.0)
+    _ba = bin_area.lower()
+    if not _ba:
+        return None
+
+    WILDCARD_WASTE = {"mixed", "all", "any", "general"}
+    matched_route = None
+    for r in db.collection("routes").where(
+        filter=FieldFilter("status", "==", "active")
+    ).stream():
+        r_data = r.to_dict()
+        r_area  = (r_data.get("assignedArea") or "").strip().lower()
+        r_waste = (r_data.get("assignedWasteType") or "").strip().lower()
+        if not r_area:
+            continue
+        area_ok  = (_ba == r_area or _ba.endswith(f", {r_area}"))
+        waste_ok = (
+            not r_waste
+            or r_waste in WILDCARD_WASTE
+            or r_waste == bin_waste
+        )
+        if area_ok and waste_ok:
+            matched_route = (r, r_data)
+            break
+
+    if matched_route is None:
+        # No active route in this bin's area — let the responsible worker(s)
+        # know an urgent pickup is waiting so they can start a route.
+        if notify_orphan:
+            _notify_orphan_critical_bin(bin_id, bin_data)
+        return None
+
+    route_doc, r_data = matched_route
+    stops = r_data.get("stops", [])
+    if any(s.get("binId") == bin_id for s in stops):
+        return r_data  # already on the route
+
+    # Lock the bin — do NOT touch its `area` field, the bin's own area is
+    # authoritative.
+    db.collection("bins").document(bin_id).update({
+        "isLocked": True,
+        "routeId":  route_doc.id,
+    })
+
+    stops.append({
+        "binId":     bin_id,
+        "lat":       bin_lat,
+        "lng":       bin_lng,
+        "fillLevel": fill_level,
+        "wasteType": bin_data.get("wasteType") or "Unknown",
+        "area":      bin_area,
+    })
+    route_doc.reference.update({
+        "stops":      stops,
+        "totalStops": r_data.get("totalStops", 0) + 1,
+    })
+
+    # FCM to the driver who owns this area's route
+    route_driver_id = r_data.get("driverId")
+    if route_driver_id:
+        worker_snap = db.collection("users").document(route_driver_id).get()
+        if worker_snap.exists:
+            fcm_token = worker_snap.to_dict().get("fcmToken")
+            if fcm_token:
+                _send_fcm(
+                    token=fcm_token,
+                    title="🚨 Urgent Pickup Added",
+                    body=f"A critically full bin in {bin_area} has been added to your route!",
+                )
+    return r_data
+
 
 # ── Routing Helpers ───────────────────────────────────────────────────────────
 def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -343,15 +533,11 @@ async def analyze_bin(
         print(f"-> Thumbnail OK ({len(thumb_buf.getvalue())} bytes → {len(image_preview_b64)} chars base64)")
 
         print("Step 4: Writing to Firestore...")
-        warning_thresh, critical_thresh = _get_thresholds()
-        bin_status = (
-            "critical" if fill_level_int >= critical_thresh
-            else "warning" if fill_level_int >= warning_thresh
-            else "normal"
-        )
         bin_lat  = lat if lat is not None else 0.0
         bin_lng  = lng if lng is not None else 0.0
         bin_area = (area or "").strip()
+        warning_thresh, critical_thresh = _get_thresholds()
+        bin_status = _classify_status(fill_level_int, warning_thresh, critical_thresh)
         bin_data: dict = {
             "fillStatus":    fill_status,
             "fillLevel":     fill_level_int,
@@ -402,47 +588,15 @@ async def analyze_bin(
                 saved_bin_id = bin_doc_id
                 print(f"-> Created new bin: {saved_bin_id}")
 
-        # --- SFR-017: FCM Push Notifications for Urgent Overflows ---
+        # --- SFR-017: Urgent overflow auto-attach + FCM push ---
         if fill_level_int >= critical_thresh:
-            # Find an active route to dynamically append this urgent pickup
-            active_routes = list(db.collection("routes").where(filter=FieldFilter("status", "==", "active")).limit(1).stream())
-            if active_routes:
-                route_doc = active_routes[0]
-                r_data = route_doc.to_dict()
-                stops = r_data.get("stops", [])
-
-                # Assign this bin to the found route
-                bin_area = r_data.get("assignedArea", "Unknown")
-
-                # We need to make sure we don't duplicate
-                if not any(s.get("binId") == saved_bin_id for s in stops):
-                    db.collection("bins").document(saved_bin_id).update({"isLocked": True, "routeId": route_doc.id, "area": bin_area})
-
-                    stops.append({
-                        "binId": saved_bin_id,
-                        "lat": lat if lat is not None else 0.0,
-                        "lng": lng if lng is not None else 0.0,
-                        "fillLevel": fill_level_int,
-                        "wasteType": primary_waste_type,
-                        "area": bin_area,
-                    })
-                    route_doc.reference.update({
-                        "stops": stops,
-                        "totalStops": r_data.get("totalStops", 0) + 1
-                    })
-
-                    # Notify the worker handling this route
-                    route_driver_id = r_data.get("driverId")
-                    if route_driver_id:
-                        worker_snap = db.collection("users").document(route_driver_id).get()
-                        if worker_snap.exists:
-                            fcm_token = worker_snap.to_dict().get("fcmToken")
-                            if fcm_token:
-                                _send_fcm(
-                                    token=fcm_token,
-                                    title="🚨 Urgent Pickup Added",
-                                    body=f"A critically full bin in {bin_area} has been added to your route!"
-                                )
+            _try_attach_urgent_bin(saved_bin_id, {
+                "area":      bin_area,
+                "wasteType": primary_waste_type,
+                "fillLevel": fill_level_int,
+                "lat":       bin_lat,
+                "lng":       bin_lng,
+            })
 
         print("========== ANALYSIS COMPLETE ==========\n")
         return {
@@ -531,11 +685,7 @@ async def rescan_bin(bin_id: str, image_file: UploadFile = File(...)):
 
         # 6. Status
         warning_thresh, critical_thresh = _get_thresholds()
-        bin_status = (
-            "critical" if fill_level_int >= critical_thresh
-            else "warning" if fill_level_int >= warning_thresh
-            else "normal"
-        )
+        bin_status = _classify_status(fill_level_int, warning_thresh, critical_thresh)
 
         # 7. Update only AI-derived fields — preserve lat/lng/area/isLocked/routeId
         bin_ref.update({
@@ -605,7 +755,7 @@ def optimize_route(req: OptimizeRouteRequest):
             detail="Worker GPS is unavailable (coordinates 0,0 are invalid). Enable location services and try again."
         )
 
-    # 2. Read admin-configurable thresholds, then fetch qualifying bins
+    # 2. Read admin-configurable thresholds, then fetch qualifying bins.
     collection_threshold, critical_threshold = _get_thresholds()
     bin_query = db.collection("bins").where(
         filter=FieldFilter("fillLevel", ">=", collection_threshold)
@@ -1529,6 +1679,84 @@ def reload_models_endpoint():
         {"lastModelUpdate": datetime.now(timezone.utc)}, merge=True
     )
     return {"success": True, "models_loaded": list(_models.keys())}
+
+
+# ── Thresholds save + retroactive recompute ───────────────────────────────────
+class SaveThresholdsRequest(BaseModel):
+    warning_threshold:  int
+    critical_threshold: int
+
+
+@app.post("/admin/save-thresholds")
+def save_thresholds(req: SaveThresholdsRequest):
+    """Persist global fill thresholds AND retroactively re-score every bin's
+    `status` field so the change applies to old bins too, not just new/rescanned
+    ones. Bins that flip to critical AND are not already locked to a route are
+    then run through the same urgent-attach logic /analyze/ uses, so a threshold
+    drop behaves symmetrically to a fresh scan."""
+    w, c = req.warning_threshold, req.critical_threshold
+    if not (0 < w < c <= 100):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid thresholds: warning ({w}) must be > 0, < critical ({c}), critical <= 100.",
+        )
+
+    # Persist BEFORE recompute so _get_thresholds reads the new values.
+    db.collection("settings").document("main").set(
+        {
+            "warningThreshold":  w,
+            "criticalThreshold": c,
+            "updatedAt":         datetime.now(timezone.utc),
+        },
+        merge=True,
+    )
+
+    # Re-score every existing bin against the new thresholds.
+    updated, newly_critical_ids = _recompute_all_bin_statuses()
+
+    # Auto-attach any newly-critical, unlocked bin to a matching active route
+    # — same behaviour as a fresh /analyze/ scan that came back critical.
+    # Orphans (no matching active route) are deferred to a single batched FCM
+    # per affected worker so we don't spam them with N pushes when N bins
+    # flip to critical from one threshold drop.
+    attached = 0
+    orphans_by_area: dict[str, list[str]] = {}
+    for bin_id in newly_critical_ids:
+        bin_snap = db.collection("bins").document(bin_id).get()
+        if not bin_snap.exists:
+            continue
+        bin_data = bin_snap.to_dict() or {}
+        result = _try_attach_urgent_bin(bin_id, bin_data, notify_orphan=False)
+        if result is not None:
+            attached += 1
+        else:
+            area = (bin_data.get("area") or bin_data.get("sector") or "").strip()
+            if area:
+                orphans_by_area.setdefault(area, []).append(bin_id)
+
+    # One summary FCM per worker, listing only the count.
+    orphan_notified = 0
+    for area, bin_ids in orphans_by_area.items():
+        count = len(bin_ids)
+        body = (
+            f"{count} critical bin{'s' if count != 1 else ''} in {area} "
+            f"need{'s' if count == 1 else ''} collection. "
+            f"Generate a route to pick {'them' if count != 1 else 'it'} up."
+        )
+        for _worker_id, w_data in _find_workers_for_area(area):
+            token = w_data.get("fcmToken")
+            if not token:
+                continue
+            _send_fcm(token=token, title="🚨 Urgent Bins — Start a Route", body=body)
+            orphan_notified += 1
+
+    return {
+        "success":         True,
+        "updated_bins":    updated,
+        "auto_attached":   attached,
+        "orphan_notified": orphan_notified,
+        "thresholds":      {"warning": w, "critical": c},
+    }
 
 
 # ── Shift Scheduling ──────────────────────────────────────────────────────────
